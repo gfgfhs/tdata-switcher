@@ -21,9 +21,17 @@ import json
 import time
 from pathlib import Path
 
+# ============== БАЗОВАЯ ПАПКА ==============
+# При сборке в .exe (PyInstaller --onefile) __file__ указывает во временную
+# папку _MEI..., поэтому берём папку, где лежит сам exe.
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).resolve().parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent
+
 # ============== НАСТРОЙКИ ==============
-TDATA_ROOT = Path(__file__).parent / "tdata"
-TELEGRAM_EXE = Path(__file__).parent / "Telegram" / "Telegram.exe"
+TDATA_ROOT = BASE_DIR / "tdata"
+TELEGRAM_EXE = BASE_DIR / "Telegram" / "Telegram.exe"
 # =======================================
 
 
@@ -44,7 +52,6 @@ def is_tdata_content(path: Path) -> bool:
 def find_accounts(root: Path) -> list[tuple[str, Path]]:
     """
     Возвращает список (красивое_имя, путь_к_папке_которая_содержит_tdata_или_является_tdata).
-    workdir будет = этот путь (если внутри есть tdata) или parent (если путь сам tdata-content).
     """
     results: list[tuple[str, Path]] = []
     seen = set()
@@ -101,21 +108,18 @@ def ensure_workdir_has_tdata(account_path: Path) -> Path:
 
     if is_tdata_content(account_path):
         # Нужно, чтобы workdir/tdata указывал на account_path
-        # Создаём папку workdirs/<name> с junction
-        work_base = Path(__file__).parent / "_workdirs"
+        work_base = BASE_DIR / "_workdirs"
         work_base.mkdir(exist_ok=True)
         safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in account_path.name)[:40]
         wd = work_base / safe
         tdata_link = wd / "tdata"
 
         if tdata_link.exists():
-            # уже есть — проверяем, куда указывает
             try:
                 if tdata_link.resolve() == account_path.resolve():
                     return wd
             except Exception:
                 pass
-            # пересоздаём
             if tdata_link.is_symlink() or tdata_link.is_dir():
                 try:
                     tdata_link.unlink()
@@ -126,13 +130,11 @@ def ensure_workdir_has_tdata(account_path: Path) -> Path:
         wd.mkdir(parents=True, exist_ok=True)
 
         if sys.platform == "win32":
-            # junction (не требует админа)
             r = subprocess.run(
                 ["cmd", "/c", "mklink", "/J", str(tdata_link), str(account_path)],
                 capture_output=True, text=True
             )
             if r.returncode != 0:
-                # fallback — копировать нельзя (медленно), просто вернём parent
                 print(f"[!] Не удалось создать junction: {r.stderr}")
                 return account_path.parent
         else:
@@ -140,27 +142,26 @@ def ensure_workdir_has_tdata(account_path: Path) -> Path:
 
         return wd
 
-    # fallback
     return account_path
 
 
 def find_telegram() -> Path | None:
     candidates = [
         TELEGRAM_EXE,
-        Path(__file__).parent / "Telegram.exe",
+        BASE_DIR / "Telegram.exe",
         Path(os.environ.get("APPDATA", "")) / "Telegram Desktop" / "Telegram.exe",
         Path(os.environ.get("LOCALAPPDATA", "")) / "Telegram Desktop" / "Telegram.exe",
     ]
     for c in candidates:
         if c and Path(c).exists():
             return Path(c)
-    for p in Path(__file__).parent.rglob("Telegram.exe"):
+    for p in BASE_DIR.rglob("Telegram.exe"):
         return p
     return None
 
 
 def load_last() -> str | None:
-    cfg = Path(__file__).parent / "last_account.json"
+    cfg = BASE_DIR / "last_account.json"
     if cfg.exists():
         try:
             return json.loads(cfg.read_text(encoding="utf-8")).get("last")
@@ -170,7 +171,7 @@ def load_last() -> str | None:
 
 
 def save_last(name: str):
-    cfg = Path(__file__).parent / "last_account.json"
+    cfg = BASE_DIR / "last_account.json"
     cfg.write_text(json.dumps({"last": name}, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -233,7 +234,7 @@ def main():
     tg = find_telegram()
     if not tg:
         print(f"\n[!] Telegram.exe не найден.")
-        print(f"    Положи Portable в папку:  {Path(__file__).parent / 'Telegram'}")
+        print(f"    Положи Portable в папку:  {BASE_DIR / 'Telegram'}")
         print(f"    (должен быть Telegram/Telegram.exe)")
         print(f"\nworkdir: {workdir}")
         input("\nEnter...")
