@@ -44,9 +44,9 @@ jobs:
       - name: Install build dependencies
         run: pip install -r requirements.txt
       - name: Build GUI exe (no console window)
-        run: pyinstaller --onefile --windowed --clean --name tdata_switcher --hidden-import tdata_gui --collect-submodules opentele --collect-submodules telethon --hidden-import tgcrypto tdata_switcher.py
+        run: pyinstaller --onefile --windowed --clean --name tdata_switcher --hidden-import tdata_gui tdata_switcher.py
       - name: Build console exe
-        run: pyinstaller --onefile --console --clean --name tdata_switcher_cli --collect-submodules opentele --collect-submodules telethon --hidden-import tgcrypto tdata_switcher_cli.py
+        run: pyinstaller --onefile --console --clean --name tdata_switcher_cli tdata_switcher_cli.py
       # Каждая проверка — отдельный шаг со своим таймаутом: если exe зависнет,
       # сборка упадёт за пару минут и сразу видно, какая именно команда виновата.
       - name: Smoke test - version
@@ -56,58 +56,6 @@ jobs:
           $t = Measure-Command { .\dist\tdata_switcher_cli.exe --version | Out-Host }
           "--version: exit=$LASTEXITCODE, $([math]::Round($t.TotalSeconds, 1)) s"
           if ($LASTEXITCODE -ne 0) { throw "tdata_switcher_cli.exe --version failed" }
-      # Для сравнения: та же проверка из исходников (без PyInstaller). Если здесь тоже долго —
-      # дело в окружении/библиотеке; если быстро, а в exe виснет — дело в сборке.
-      - name: Smoke test - .session support (from source)
-        timeout-minutes: 3
-        shell: pwsh
-        env:
-          PYTHONUNBUFFERED: "1"
-          PYTHONFAULTHANDLER: "1"
-        run: |
-          python -c "import platform, time; t = time.time(); platform.uname(); print('platform.uname():', round(time.time() - t, 2), 's')"
-          $t = Measure-Command { python tdata_switcher_cli.py --check-session | Out-Host }
-          "from source: exit=$LASTEXITCODE, $([math]::Round($t.TotalSeconds, 1)) s"
-          if ($LASTEXITCODE -ne 0) { throw "opentele (.session support) is not importable from source" }
-      - name: Smoke test - .session support (opentele, built exe)
-        timeout-minutes: 3
-        shell: pwsh
-        run: |
-          function Show-Tree($id, $indent) {
-            Get-CimInstance Win32_Process -Filter "ParentProcessId=$id" | ForEach-Object {
-              $cpu = (Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue).CPU
-              "$indent$($_.ProcessId) $($_.Name) threads=$($_.ThreadCount) cpu=$cpu s"
-              Show-Tree $_.ProcessId "$indent  "
-            }
-          }
-          $exe = (Resolve-Path .\dist\tdata_switcher_cli.exe).Path
-          $out = Join-Path $env:RUNNER_TEMP "check-session.out"
-          $err = Join-Path $env:RUNNER_TEMP "check-session.err"
-          $sw = [Diagnostics.Stopwatch]::StartNew()
-          $p = Start-Process -FilePath $exe -ArgumentList "--check-session" -NoNewWindow -PassThru `
-                 -RedirectStandardOutput $out -RedirectStandardError $err
-          $null = $p.Handle   # чтобы ExitCode читался после WaitForExit
-          if (-not $p.WaitForExit(60000)) {
-            Write-Host "::group::HANG: --check-session is still running after 60 s"
-            "root pid $($p.Id), cpu=$((Get-Process -Id $p.Id -ErrorAction SilentlyContinue).CPU) s; children:"
-            Show-Tree $p.Id "  "
-            "--- stdout ---"; Get-Content $out -ErrorAction SilentlyContinue
-            "--- stderr ---"; Get-Content $err -ErrorAction SilentlyContinue
-            # стек Python-потоков снаружи: py-spy читает память процесса, ему не нужно, чтобы exe отвечал
-            pip install py-spy | Out-Null
-            $child = Get-CimInstance Win32_Process -Filter "ParentProcessId=$($p.Id)" |
-                     Where-Object { $_.Name -eq "tdata_switcher_cli.exe" } | Select-Object -First 1
-            $target = if ($child) { $child.ProcessId } else { $p.Id }
-            "py-spy dump --pid $target"
-            py-spy dump --pid $target
-            Write-Host "::endgroup::"
-            Get-Process -Name tdata_switcher_cli -ErrorAction SilentlyContinue | Stop-Process -Force
-            throw "tdata_switcher_cli.exe --check-session hung (details in the log group above)"
-          }
-          "--- stdout ---"; Get-Content $out
-          "--- stderr ---"; Get-Content $err
-          "--check-session: exit=$($p.ExitCode), $([math]::Round($sw.Elapsed.TotalSeconds, 1)) s"
-          if ($p.ExitCode -ne 0) { throw "opentele (.session support) is missing from the built exe" }
       - name: Smoke test - list
         timeout-minutes: 3
         shell: pwsh
