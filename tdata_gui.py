@@ -171,57 +171,6 @@ class LabelDialog(tk.Toplevel):
         self.destroy()
 
 
-class SessionDialog(tk.Toplevel):
-    """Параметры входа по .session: какая сессия создаётся и пароль двухэтапной проверки."""
-
-    def __init__(self, parent, count: int, new_default: bool):
-        super().__init__(parent)
-        self.title("Вход по .session")
-        self.resizable(False, False)
-        self.transient(parent)
-        self.result: tuple[str, str | None] | None = None
-
-        frm = ttk.Frame(self, padding=12)
-        frm.pack(fill="both", expand=True)
-        ttk.Label(frm, text=f"Файлов .session: {count}. Понадобится доступ к Telegram.").grid(
-            row=0, column=0, sticky="w")
-
-        self.new_var = tk.BooleanVar(value=new_default)
-        ttk.Checkbutton(frm, text="Создать новую сессию (безопаснее)",
-                        variable=self.new_var).grid(row=1, column=0, sticky="w", pady=(10, 2))
-        ttk.Label(
-            frm, foreground="#666", wraplength=400, justify="left",
-            text=("Выключено: берётся тот же ключ, что в .session. Быстро, но потом не запускайте "
-                  "эту .session параллельно с Telegram Desktop: Telegram может её сбросить.\n"
-                  "Включено: .session остаётся рабочей независимо от Telegram Desktop. "
-                  "Если включена двухэтапная проверка, понадобится пароль."),
-        ).grid(row=2, column=0, sticky="w")
-
-        ttk.Label(frm, text="Пароль 2FA (если есть):").grid(row=3, column=0, sticky="w", pady=(10, 2))
-        self.pw_var = tk.StringVar()
-        self.pw_entry = ttk.Entry(frm, textvariable=self.pw_var, show="*", width=32)
-        self.pw_entry.grid(row=4, column=0, sticky="w")
-
-        buttons = ttk.Frame(frm)
-        buttons.grid(row=5, column=0, sticky="e", pady=(12, 0))
-        ttk.Button(buttons, text="Импортировать", command=self._ok).pack(side="left", padx=(0, 6))
-        ttk.Button(buttons, text="Отмена", command=self.destroy).pack(side="left")
-
-        self.bind("<Return>", lambda _e: self._ok())
-        self.bind("<Escape>", lambda _e: self.destroy())
-        self.geometry(f"+{parent.winfo_rootx() + 60}+{parent.winfo_rooty() + 60}")
-        try:
-            self.wait_visibility()
-            self.grab_set()
-        except tk.TclError:
-            pass
-        self.pw_entry.focus_set()
-
-    def _ok(self) -> None:
-        self.result = ("new" if self.new_var.get() else "current", self.pw_var.get() or None)
-        self.destroy()
-
-
 class LabelManager(tk.Toplevel):
     """Окно «Метки»: список всех меток с цветом и числом аккаунтов; добавить / изменить / удалить."""
 
@@ -360,7 +309,7 @@ class App(tk.Tk):
             ("Запустить", self.launch_selected),
             ("Ярлык на рабочий стол", self.make_shortcuts),
             ("Метки ▾", self._popup_label_menu),
-            ("Импорт…", self.import_archives),
+            ("Импорт архива…", self.import_archives),
             ("Обновить", self.refresh),
         ):
             btn = ttk.Button(row, text=text, command=command)
@@ -433,7 +382,7 @@ class App(tk.Tk):
         if self.accounts:
             self.status.set(f"Аккаунтов: {len(self.accounts)}")
         else:
-            self.status.set("Аккаунтов нет — нажмите «Импорт…» или положите папки в tdata/")
+            self.status.set("Аккаунтов нет — нажмите «Импорт архива…» или положите папки в tdata/")
 
     def label_counts(self) -> dict[str, int]:
         """Сколько из ТЕКУЩИХ аккаунтов несёт каждая метка."""
@@ -731,47 +680,27 @@ class App(tk.Tk):
         if self.busy:
             return
         files = filedialog.askopenfilenames(
-            parent=self, title="Выберите архивы с tdata или файлы .session",
-            filetypes=[("Архивы и сессии", "*.zip *.rar *.7z *.session"),
-                       ("Архивы", "*.zip *.rar *.7z"), ("Сессии Telegram", "*.session"),
-                       ("Все файлы", "*.*")])
+            parent=self, title="Выберите архивы с tdata",
+            filetypes=[("Архивы", "*.zip *.rar *.7z"), ("Все файлы", "*.*")])
         if not files:
             return
-        paths = [Path(f) for f in files]
-        session_opts = ("current", None)
-        sessions = [p for p in paths if core.is_session_file(p)]
-        if sessions:
-            dialog = SessionDialog(self, len(sessions),
-                                   bool(core.load_settings().get("session_new")))
-            self.wait_window(dialog)
-            if dialog.result is None:
-                return
-            session_opts = dialog.result
-            core.save_settings(session_new=session_opts[0] == "new")
         self._set_busy(True)
         self.status.set("Импорт…")
-        threading.Thread(target=self._import_worker, args=(paths, session_opts),
-                         daemon=True).start()
+        threading.Thread(target=self._import_worker,
+                         args=([Path(f) for f in files],), daemon=True).start()
 
-    def _import_worker(self, archives: list[Path], session_opts: tuple = ("current", None)) -> None:
+    def _import_worker(self, archives: list[Path]) -> None:
         """Работает в потоке; с интерфейсом общается только через очередь."""
         imported: list[str] = []
         errors: list[str] = []
-        mode, session_password = session_opts
         for archive in archives:
-            is_session = core.is_session_file(archive)
-            password = session_password if is_session else None
+            password = None
             for _attempt in range(3):
                 try:
-                    progress = lambda msg: self.events.put(("status", msg))  # noqa: E731
-                    if is_session:
-                        name, _path = core.import_session(
-                            archive, self.root_dir, mode=mode, password=password, progress=progress)
-                        imported.append(name)
-                    else:
-                        result = core.import_archive(
-                            archive, self.root_dir, password=password, progress=progress)
-                        imported += [name for name, _ in result]
+                    result = core.import_archive(
+                        archive, self.root_dir, password=password,
+                        progress=lambda msg: self.events.put(("status", msg)))
+                    imported += [name for name, _ in result]
                     break
                 except PasswordRequired:
                     reply: queue.Queue = queue.Queue()
@@ -798,14 +727,10 @@ class App(tk.Tk):
                 if kind == "status":
                     self.status.set(event[1])
                 elif kind == "password":
-                    if core.is_session_file(event[1]):
-                        title = "Пароль 2FA"
-                        prompt = (f"Для «{event[1].name}» нужен пароль двухэтапной "
-                                  "проверки (2FA).\nВведите пароль:")
-                    else:
-                        title = "Пароль архива"
-                        prompt = f"Архив «{event[1].name}» защищён паролем.\nВведите пароль:"
-                    pw = simpledialog.askstring(title, prompt, show="*", parent=self)
+                    pw = simpledialog.askstring(
+                        "Пароль архива",
+                        f"Архив «{event[1].name}» защищён паролем.\nВведите пароль:",
+                        show="*", parent=self)
                     event[2].put(pw or None)
                 elif kind == "done":
                     self._import_done(event[1], event[2])

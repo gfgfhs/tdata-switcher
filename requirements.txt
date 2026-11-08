@@ -1,3 +1,1 @@
 pyinstaller>=6.0
-# вход по .session (Python 3.10+); без неё программа работает, кроме импорта .session
-opentele-ng>=1.4.1
