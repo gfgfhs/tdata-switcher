@@ -30,6 +30,7 @@ jobs:
     name: build exe (Windows)
     needs: test
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -41,14 +42,32 @@ jobs:
         run: pyinstaller --onefile --windowed --clean --name tdata_switcher --hidden-import tdata_gui --collect-submodules opentele --collect-submodules telethon --hidden-import tgcrypto tdata_switcher.py
       - name: Build console exe
         run: pyinstaller --onefile --console --clean --name tdata_switcher_cli --collect-submodules opentele --collect-submodules telethon --hidden-import tgcrypto tdata_switcher_cli.py
-      - name: Smoke test
+      # Каждая проверка — отдельный шаг со своим таймаутом: если exe зависнет,
+      # сборка упадёт за пару минут и сразу видно, какая именно команда виновата.
+      - name: Smoke test - version
+        timeout-minutes: 3
         shell: pwsh
         run: |
-          .\dist\tdata_switcher_cli.exe --version
-          .\dist\tdata_switcher_cli.exe --check-session
-          if ($LASTEXITCODE -ne 0) { throw "opentele (.session support) is missing from the built exe" }
+          $t = Measure-Command { .\dist\tdata_switcher_cli.exe --version | Out-Host }
+          "--version: exit=$LASTEXITCODE, $([math]::Round($t.TotalSeconds, 1)) s"
+          if ($LASTEXITCODE -ne 0) { throw "tdata_switcher_cli.exe --version failed" }
+      - name: Smoke test - .session support (opentele)
+        timeout-minutes: 3
+        shell: pwsh
+        env:
+          PYTHONUNBUFFERED: "1"
+          PYTHONFAULTHANDLER: "1"
+        run: |
+          # stdin закрыт: если программа вдруг ждёт ввод, она упадёт, а не повиснет.
+          $t = Measure-Command { $null | .\dist\tdata_switcher_cli.exe --check-session | Out-Host }
+          "--check-session: exit=$LASTEXITCODE, $([math]::Round($t.TotalSeconds, 1)) s"
+          if ($LASTEXITCODE -ne 0) { throw "opentele (.session support) is missing from the built exe or hung on import" }
+      - name: Smoke test - list
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
           New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\empty-root" | Out-Null
-          .\dist\tdata_switcher_cli.exe --list --root "$env:RUNNER_TEMP\empty-root"
+          $null | .\dist\tdata_switcher_cli.exe --list --root "$env:RUNNER_TEMP\empty-root"
           if ($LASTEXITCODE -ne 0) { throw "tdata_switcher_cli.exe --list failed" }
       - name: SHA256 checksums
         shell: pwsh

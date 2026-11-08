@@ -124,8 +124,20 @@ def do_shortcuts(names: list[str], root: Path) -> int:
     return code
 
 
-def check_session_support() -> int:
-    """0 — всё нужное для .session на месте (используется и в CI для проверки собранного exe)."""
+def check_session_support(timeout: int = 90) -> int:
+    """0 — всё нужное для .session на месте (используется и в CI для проверки собранного exe).
+
+    Если импорт opentele/telethon зависнет, через `timeout` секунд в stderr печатается стек
+    всех потоков и процесс завершается с кодом 1 — вместо вечного ожидания в CI.
+    """
+    import faulthandler
+
+    armed = False
+    try:
+        faulthandler.dump_traceback_later(timeout, exit=True)
+        armed = True
+    except Exception:  # noqa: BLE001 — нет stderr (оконный exe) и т.п.: просто без сторожа
+        pass
     try:
         import telethon
         import opentele
@@ -134,8 +146,11 @@ def check_session_support() -> int:
         from opentele.tl import TelegramClient  # noqa: F401
     except Exception as e:  # noqa: BLE001
         _say(f"[!] Поддержка .session недоступна: {type(e).__name__}: {e}")
-        _say("    Установите: pip install opentele-ng (нужен Python 3.10+)")
+        _say("    Установите: pip install opentele-ng (нужен Python 3.11+)")
         return 1
+    finally:
+        if armed:
+            faulthandler.cancel_dump_traceback_later()
     _say(f"[+] Поддержка .session: OK (opentele {getattr(opentele, '__version__', '?')}, "
          f"telethon {getattr(telethon, '__version__', '?')})")
     return 0
