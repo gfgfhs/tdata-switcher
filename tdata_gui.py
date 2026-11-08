@@ -10,10 +10,16 @@ import sys
 import threading
 from pathlib import Path
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 
 import tdata_core as core
 from tdata_core import PasswordRequired, SwitcherError, TelegramNotFound
+
+SWATCH = 12        # размер цветного квадратика, px
+STRIP_MAX = 5      # сколько квадратиков меток показываем в строке списка
+STRIP_GAP = 3
+ACTIVE_BORDER = "#202020"
+NO_LABEL = object()  # служебный ключ фильтра «Без метки»
 
 
 def open_in_file_manager(path: Path) -> None:
@@ -25,19 +31,228 @@ def open_in_file_manager(path: Path) -> None:
         subprocess.Popen(["xdg-open", str(path)])
 
 
+def frame_background(widget) -> str:
+    return ttk.Style(widget).lookup("TFrame", "background") or "#f0f0f0"
+
+
+# ---------------------------------------------------------------- виджеты
+
+class ChipBar(tk.Frame):
+    """Цветные плашки-метки; сами переносятся на следующую строку при нехватке ширины."""
+
+    def __init__(self, master, bg: str):
+        super().__init__(master, bg=bg, height=1)
+        self.bg = bg
+        self.chips: list[tuple[object, tk.Frame]] = []
+        self._height = 1
+        self.bind("<Configure>", lambda _e: self.reflow())
+
+    def clear(self) -> None:
+        for _key, chip in self.chips:
+            chip.destroy()
+        self.chips = []
+
+    def add_chip(self, key, text: str, color: str, on_click) -> None:
+        border = tk.Frame(self, bg=self.bg, padx=2, pady=2, cursor="hand2")
+        label = tk.Label(border, text=text, bg=color, fg=core.text_color_for(color),
+                         padx=8, pady=2, cursor="hand2")
+        label.pack()
+        for w in (border, label):
+            w.bind("<Button-1>", lambda _e, k=key: on_click(k))
+        self.chips.append((key, border))
+
+    def set_active(self, keys: set) -> None:
+        for key, chip in self.chips:
+            chip.configure(bg=ACTIVE_BORDER if key in keys else self.bg)
+
+    def reflow(self) -> None:
+        width = max(self.winfo_width(), 1)
+        x = y = row_h = 0
+        for _key, chip in self.chips:
+            w, h = chip.winfo_reqwidth(), chip.winfo_reqheight()
+            if x and x + w > width:
+                x, y, row_h = 0, y + row_h, 0
+            chip.place(x=x, y=y)
+            x += w + 2
+            row_h = max(row_h, h)
+        need = max(y + row_h, 1)
+        if need != self._height:  # защита от бесконечного <Configure>
+            self._height = need
+            self.configure(height=need)
+
+
+class LabelDialog(tk.Toplevel):
+    """Диалог метки: название + цвет из палитры (или любой через системный выбор цвета)."""
+
+    def __init__(self, parent, title: str, validator, name: str = "", color: str | None = None):
+        super().__init__(parent)
+        self.title(title)
+        self.resizable(False, False)
+        self.transient(parent)
+        self.validator = validator
+        self.result: tuple[str, str] | None = None
+        self.color = core.normalize_color(color) if color else core.LABEL_PALETTE[0]
+        self._bg = frame_background(self)
+        self.cells: dict[str, tk.Frame] = {}
+
+        frm = ttk.Frame(self, padding=12)
+        frm.pack(fill="both", expand=True)
+
+        ttk.Label(frm, text="Название:").grid(row=0, column=0, sticky="w")
+        self.name_var = tk.StringVar(value=name)
+        self.name_var.trace_add("write", lambda *_: self._refresh_preview())
+        self.entry = ttk.Entry(frm, textvariable=self.name_var, width=30)
+        self.entry.grid(row=1, column=0, columnspan=2, sticky="we", pady=(2, 10))
+
+        ttk.Label(frm, text="Цвет:").grid(row=2, column=0, sticky="w")
+        palette = tk.Frame(frm, bg=self._bg)
+        palette.grid(row=3, column=0, columnspan=2, sticky="w", pady=(2, 4))
+        for i, c in enumerate(core.LABEL_PALETTE):
+            cell = tk.Frame(palette, bg=self._bg, padx=2, pady=2, cursor="hand2")
+            swatch = tk.Label(cell, bg=c, width=3, height=1, cursor="hand2")
+            swatch.pack()
+            for w in (cell, swatch):
+                w.bind("<Button-1>", lambda _e, col=c: self._pick(col))
+            cell.grid(row=i // 5, column=i % 5)
+            self.cells[c] = cell
+        ttk.Button(frm, text="Другой цвет…", command=self._custom).grid(
+            row=4, column=0, sticky="w", pady=(4, 8))
+
+        self.preview = tk.Label(frm, padx=10, pady=3)
+        self.preview.grid(row=4, column=1, sticky="e", pady=(4, 8))
+
+        self.error = tk.StringVar()
+        ttk.Label(frm, textvariable=self.error, foreground="#c0392b").grid(
+            row=5, column=0, columnspan=2, sticky="w")
+
+        buttons = ttk.Frame(frm)
+        buttons.grid(row=6, column=0, columnspan=2, sticky="e", pady=(8, 0))
+        ttk.Button(buttons, text="OK", command=self._ok).pack(side="left", padx=(0, 6))
+        ttk.Button(buttons, text="Отмена", command=self.destroy).pack(side="left")
+
+        self.bind("<Return>", lambda _e: self._ok())
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self._pick(self.color)
+
+        self.geometry(f"+{parent.winfo_rootx() + 60}+{parent.winfo_rooty() + 60}")
+        try:
+            self.wait_visibility()
+            self.grab_set()
+        except tk.TclError:
+            pass
+        self.entry.focus_set()
+        self.entry.select_range(0, "end")
+
+    def _refresh_preview(self) -> None:
+        self.preview.configure(text=" ".join(self.name_var.get().split()) or "Метка",
+                               bg=self.color, fg=core.text_color_for(self.color))
+
+    def _pick(self, color: str) -> None:
+        self.color = color
+        for c, cell in self.cells.items():
+            cell.configure(bg=ACTIVE_BORDER if c == color else self._bg)
+        self._refresh_preview()
+
+    def _custom(self) -> None:
+        _rgb, chosen = colorchooser.askcolor(color=self.color, parent=self, title="Цвет метки")
+        if chosen:
+            try:
+                self._pick(core.normalize_color(chosen))
+            except SwitcherError:
+                pass
+
+    def _ok(self) -> None:
+        try:
+            clean = self.validator(self.name_var.get())
+        except SwitcherError as e:
+            self.error.set(str(e))
+            return
+        self.result = (clean, self.color)
+        self.destroy()
+
+
+class LabelManager(tk.Toplevel):
+    """Окно «Метки»: список всех меток с цветом и числом аккаунтов; добавить / изменить / удалить."""
+
+    def __init__(self, app: "App"):
+        super().__init__(app)
+        self.app = app
+        self.title("Метки")
+        self.geometry("380x340")
+        self.minsize(320, 240)
+        self.transient(app)
+
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True, padx=10, pady=(10, 4))
+        self.tree = ttk.Treeview(body, columns=("count",), selectmode="browse")
+        self.tree.heading("#0", text="Метка", anchor="w")
+        self.tree.heading("count", text="Аккаунтов")
+        self.tree.column("#0", width=230, stretch=True)
+        self.tree.column("count", width=80, anchor="center", stretch=False)
+        scroll = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        row = ttk.Frame(self)
+        row.pack(fill="x", padx=10, pady=(4, 10))
+        ttk.Button(row, text="Добавить…", command=self._add).pack(side="left", padx=(0, 6))
+        ttk.Button(row, text="Изменить…", command=self._edit).pack(side="left", padx=(0, 6))
+        ttk.Button(row, text="Удалить", command=self._delete).pack(side="left")
+        ttk.Button(row, text="Закрыть", command=self.destroy).pack(side="right")
+
+        self.tree.bind("<Double-1>", lambda _e: self._edit())
+        self.tree.bind("<Delete>", lambda _e: self._delete())
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.reload()
+
+    def reload(self) -> None:
+        counts = self.app.label_counts()
+        self.tree.delete(*self.tree.get_children())
+        for name, color in self.app.labels["labels"].items():
+            self.tree.insert("", "end", iid=name, text=name, image=self.app.swatch(color),
+                             values=(counts.get(name, 0),))
+
+    def _current(self) -> str | None:
+        sel = self.tree.selection()
+        return sel[0] if sel else None
+
+    def _add(self) -> None:
+        self.app.new_label(assign=False)
+
+    def _edit(self) -> None:
+        name = self._current()
+        if name:
+            self.app.edit_label(name)
+
+    def _delete(self) -> None:
+        name = self._current()
+        if name:
+            self.app.delete_label(name)
+
+
+# --------------------------------------------------------------- приложение
+
 class App(tk.Tk):
     def __init__(self, root_dir: Path):
         super().__init__()
         self.root_dir = root_dir
         self.accounts: list[tuple[str, Path]] = []
         self.shown: dict[str, tuple[str, Path]] = {}  # iid строки → аккаунт
+        self.labels: dict = {"labels": {}, "accounts": {}}
+        self.filter_keys: set = set()
         self.events: queue.Queue = queue.Queue()
         self.busy = False
         self.buttons: list[ttk.Button] = []
+        self.manager: LabelManager | None = None
+        self._swatches: dict[str, tk.PhotoImage] = {}
+        self._strips: dict[tuple, tk.PhotoImage] = {}
+        self._menu_vars: list[tk.BooleanVar] = []
+        self._popup_menu: tk.Menu | None = None
 
         self.title(f"tdata-switcher {core.__version__}")
-        self.geometry("640x500")
-        self.minsize(500, 380)
+        self.geometry("700x580")
+        self.minsize(520, 420)
 
         self._build()
         self.refresh()
@@ -47,6 +262,8 @@ class App(tk.Tk):
     # ------------------------------------------------------------------ UI
 
     def _build(self) -> None:
+        bg = frame_background(self)
+
         header = ttk.Frame(self)
         header.pack(fill="x", padx=10, pady=(10, 4))
         ttk.Label(header, text="Папка с аккаунтами:").pack(side="left")
@@ -58,17 +275,29 @@ class App(tk.Tk):
         search.pack(fill="x", padx=10, pady=4)
         ttk.Label(search, text="Поиск:").pack(side="left")
         self.search_var = tk.StringVar()
-        self.search_var.trace_add("write", lambda *_: self._fill())
+        self.search_var.trace_add("write", lambda *_: self._refilter())
         self.search_entry = ttk.Entry(search, textvariable=self.search_var)
         self.search_entry.pack(side="left", fill="x", expand=True, padx=(6, 0))
 
+        chips_row = ttk.Frame(self)
+        chips_row.pack(fill="x", padx=10, pady=(0, 4))
+        ttk.Label(chips_row, text="Метки:").pack(side="left", anchor="n", pady=(4, 0))
+        self.chips_hint = ttk.Label(
+            chips_row, foreground="#666",
+            text="пока нет — создайте через кнопку «Метки ▾»")
+        self.chips_hint.pack(side="left", padx=(6, 0), pady=(4, 0))
+        self.chipbar = ChipBar(chips_row, bg)
+        self.chipbar.pack(side="left", fill="x", expand=True, padx=(6, 0))
+
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True, padx=10, pady=4)
-        self.tree = ttk.Treeview(body, columns=("last",), selectmode="extended")
+        self.tree = ttk.Treeview(body, columns=("labels", "last"), selectmode="extended")
         self.tree.heading("#0", text="Аккаунт", anchor="w")
+        self.tree.heading("labels", text="Метки", anchor="w")
         self.tree.heading("last", text="")
-        self.tree.column("#0", width=420, stretch=True)
-        self.tree.column("last", width=110, anchor="center", stretch=False)
+        self.tree.column("#0", width=300, stretch=True)
+        self.tree.column("labels", width=190, stretch=True)
+        self.tree.column("last", width=90, anchor="center", stretch=False)
         scroll = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
         self.tree.pack(side="left", fill="both", expand=True)
@@ -79,12 +308,14 @@ class App(tk.Tk):
         for text, command in (
             ("Запустить", self.launch_selected),
             ("Ярлык на рабочий стол", self.make_shortcuts),
+            ("Метки ▾", self._popup_label_menu),
             ("Импорт архива…", self.import_archives),
             ("Обновить", self.refresh),
         ):
             btn = ttk.Button(row, text=text, command=command)
             btn.pack(side="left", padx=(0, 6))
             self.buttons.append(btn)
+        self.labels_btn = self.buttons[2]
 
         self.close_var = tk.BooleanVar(value=bool(core.load_settings().get("close_after_launch")))
         self.close_var.trace_add(
@@ -96,34 +327,44 @@ class App(tk.Tk):
         ttk.Label(self, textvariable=self.status, relief="sunken", anchor="w",
                   padding=(6, 2)).pack(fill="x", side="bottom", pady=(6, 0))
 
-        # контекстное меню
-        self.menu = tk.Menu(self, tearoff=0)
-        self.menu.add_command(label="Запустить", command=self.launch_selected)
-        self.menu.add_command(label="Ярлык на рабочий стол", command=self.make_shortcuts)
-        self.menu.add_command(label="Открыть папку аккаунта", command=self.open_account_folder)
-
-        self.tree.bind("<Double-1>", lambda e: self.launch_selected())
-        self.tree.bind("<Return>", lambda e: self.launch_selected())
+        self.tree.bind("<Double-1>", lambda _e: self.launch_selected())
+        self.tree.bind("<Return>", lambda _e: self.launch_selected())
         self.tree.bind("<Button-3>", self._popup)
         self.tree.bind("<Button-2>", self._popup)
-        self.search_entry.bind("<Return>", lambda e: self.launch_selected())
-        self.search_entry.bind("<Down>", lambda e: (self.tree.focus_set(), "break")[1])
-        self.bind("<F5>", lambda e: self.refresh())
-        self.bind("<Control-i>", lambda e: self.import_archives())
-        self.bind("<Control-f>", lambda e: self.search_entry.focus_set())
-        self.bind("<Escape>", lambda e: self.search_var.set(""))
-
-    def _popup(self, event) -> None:
-        iid = self.tree.identify_row(event.y)
-        if iid:
-            if iid not in self.tree.selection():
-                self.tree.selection_set(iid)
-            self.menu.tk_popup(event.x_root, event.y_root)
+        self.search_entry.bind("<Return>", lambda _e: self.launch_selected())
+        self.search_entry.bind("<Down>", lambda _e: (self.tree.focus_set(), "break")[1])
+        self.bind("<F5>", lambda _e: self.refresh())
+        self.bind("<Control-i>", lambda _e: self.import_archives())
+        self.bind("<Control-f>", lambda _e: self.search_entry.focus_set())
+        self.bind("<Control-l>", lambda _e: self._popup_label_menu())
+        self.bind("<Escape>", lambda _e: self.search_var.set(""))
 
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
         for btn in self.buttons:
             btn.state(["disabled"] if busy else ["!disabled"])
+
+    # ---------------------------------------------------- картинки (цвета)
+
+    def swatch(self, color: str) -> tk.PhotoImage:
+        img = self._swatches.get(color)
+        if img is None:
+            img = tk.PhotoImage(master=self, width=SWATCH, height=SWATCH)
+            img.put(color, to=(0, 0, SWATCH, SWATCH))
+            self._swatches[color] = img
+        return img
+
+    def _strip(self, colors: list[str]) -> tk.PhotoImage:
+        """Полоска цветных квадратиков фиксированной ширины (чтобы имена выравнивались)."""
+        key = tuple(colors[:STRIP_MAX])
+        img = self._strips.get(key)
+        if img is None:
+            img = tk.PhotoImage(master=self, width=STRIP_MAX * (SWATCH + STRIP_GAP), height=SWATCH)
+            for i, c in enumerate(key):
+                x = i * (SWATCH + STRIP_GAP)
+                img.put(c, to=(x, 0, x + SWATCH, SWATCH))
+            self._strips[key] = img
+        return img
 
     # ------------------------------------------------------------ аккаунты
 
@@ -133,6 +374,8 @@ class App(tk.Tk):
         except OSError as e:
             self.accounts = []
             messagebox.showerror("Ошибка чтения папки", str(e), parent=self)
+        self.labels = core.load_labels(self.root_dir)
+        self._rebuild_chips()
         self._fill()
         if self.busy:
             return
@@ -140,6 +383,25 @@ class App(tk.Tk):
             self.status.set(f"Аккаунтов: {len(self.accounts)}")
         else:
             self.status.set("Аккаунтов нет — нажмите «Импорт архива…» или положите папки в tdata/")
+
+    def label_counts(self) -> dict[str, int]:
+        """Сколько из ТЕКУЩИХ аккаунтов несёт каждая метка."""
+        counts = {n: 0 for n in self.labels["labels"]}
+        for name, _p in self.accounts:
+            for label in core.account_labels(self.labels, name):
+                counts[label] += 1
+        return counts
+
+    def _matches(self, name: str, query: str) -> bool:
+        mine = core.account_labels(self.labels, name)
+        if NO_LABEL in self.filter_keys:
+            if mine:
+                return False
+        elif not all(k in mine for k in self.filter_keys):
+            return False
+        if query and query not in name.lower() and not any(query in m.lower() for m in mine):
+            return False
+        return True
 
     def _fill(self) -> None:
         query = self.search_var.get().strip().lower()
@@ -150,12 +412,14 @@ class App(tk.Tk):
         to_select = []
         for idx, acc in enumerate(self.accounts):
             name = acc[0]
-            if query and query not in name.lower():
+            if not self._matches(name, query):
                 continue
+            mine = core.account_labels(self.labels, name)
+            colors = [self.labels["labels"][m] for m in mine]
             iid = str(idx)
             self.shown[iid] = acc
-            self.tree.insert("", "end", iid=iid, text=name,
-                             values=("последний" if name == last else "",))
+            self.tree.insert("", "end", iid=iid, text=name, image=self._strip(colors),
+                             values=(", ".join(mine), "последний" if name == last else ""))
             if name in keep:
                 to_select.append(iid)
         if not to_select:
@@ -167,6 +431,11 @@ class App(tk.Tk):
             self.tree.focus(to_select[0])
             self.tree.see(to_select[0])
 
+    def _refilter(self) -> None:
+        self._fill()
+        if self.search_var.get().strip() or self.filter_keys:
+            self.status.set(f"Показано {len(self.shown)} из {len(self.accounts)}")
+
     def _selected(self) -> list[tuple[str, Path]]:
         return [self.shown[i] for i in self.tree.selection() if i in self.shown]
 
@@ -175,6 +444,168 @@ class App(tk.Tk):
         if wanted:
             self.tree.selection_set(wanted)
             self.tree.see(wanted[0])
+
+    # -------------------------------------------------------------- метки
+
+    def _rebuild_chips(self) -> None:
+        labels = self.labels["labels"]
+        counts = self.label_counts()
+        unlabeled = sum(1 for name, _p in self.accounts
+                        if not core.account_labels(self.labels, name))
+        self.filter_keys &= set(labels) | {NO_LABEL}  # удалённые метки из фильтра уходят
+        self.chipbar.clear()
+        for name, color in labels.items():
+            self.chipbar.add_chip(name, f"{name} · {counts[name]}", color, self._toggle_filter)
+        if labels:
+            self.chipbar.add_chip(NO_LABEL, f"Без метки · {unlabeled}", "#d0d0d0",
+                                  self._toggle_filter)
+            self.chips_hint.pack_forget()
+        else:
+            self.chips_hint.pack(side="left", padx=(6, 0), pady=(4, 0), before=self.chipbar)
+        self.chipbar.set_active(self.filter_keys)
+        self.chipbar.reflow()
+
+    def _toggle_filter(self, key) -> None:
+        if key is NO_LABEL:
+            self.filter_keys = set() if NO_LABEL in self.filter_keys else {NO_LABEL}
+        else:
+            self.filter_keys.discard(NO_LABEL)
+            self.filter_keys ^= {key}  # переключатель; несколько меток = аккаунты со ВСЕМИ ими
+        self.chipbar.set_active(self.filter_keys)
+        self._refilter()
+        if not self.filter_keys and not self.search_var.get().strip():
+            self.status.set(f"Аккаунтов: {len(self.accounts)}")
+
+    def _labels_changed(self) -> None:
+        self._rebuild_chips()
+        self._fill()
+        if self.manager is not None and self.manager.winfo_exists():
+            self.manager.reload()
+
+    def _build_label_menu(self, parent) -> tk.Menu:
+        """Меню «Метки»: галочки для выделенных аккаунтов + создание и управление."""
+        menu = tk.Menu(parent, tearoff=0)
+        selected = [n for n, _p in self._selected()]
+        self._menu_vars = []
+        for name, color in self.labels["labels"].items():
+            has_all = bool(selected) and all(
+                name in core.account_labels(self.labels, a) for a in selected)
+            var = tk.BooleanVar(value=has_all)
+            self._menu_vars.append(var)
+            menu.add_checkbutton(
+                label=name, variable=var, image=self.swatch(color), compound="left",
+                state="normal" if selected else "disabled",
+                command=lambda n=name, v=var: self._toggle_label(n, bool(v.get())))
+        if self.labels["labels"]:
+            menu.add_separator()
+        menu.add_command(label="Новая метка…", command=lambda: self.new_label(assign=True))
+        menu.add_command(label="Управление метками…", command=self.manage_labels)
+        return menu
+
+    def _popup_label_menu(self) -> None:
+        menu = self._build_label_menu(self)
+        self._popup_menu = menu
+        b = self.labels_btn
+        try:
+            menu.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height())
+        finally:
+            menu.grab_release()
+
+    def _popup(self, event) -> None:
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        if iid not in self.tree.selection():
+            self.tree.selection_set(iid)
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Запустить", command=self.launch_selected)
+        menu.add_cascade(label="Метки", menu=self._build_label_menu(menu))
+        menu.add_command(label="Ярлык на рабочий стол", command=self.make_shortcuts)
+        menu.add_command(label="Открыть папку аккаунта", command=self.open_account_folder)
+        self._popup_menu = menu
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _toggle_label(self, label: str, present: bool) -> None:
+        names = [n for n, _p in self._selected()]
+        if not names:
+            return
+        try:
+            self.labels = core.set_account_label(self.root_dir, names, label, present)
+        except SwitcherError as e:
+            messagebox.showerror("Метки", str(e), parent=self)
+            return
+        self._labels_changed()
+        verb = "поставлена" if present else "снята"
+        self.status.set(f"Метка «{label}» {verb}: аккаунтов {len(names)}")
+
+    def _ask_label(self, title: str, validator, name: str = "", color: str | None = None):
+        dialog = LabelDialog(self, title, validator, name, color)
+        self.wait_window(dialog)
+        return dialog.result
+
+    def new_label(self, assign: bool = False) -> None:
+        """Создать метку; assign=True — сразу повесить на выделенные аккаунты."""
+        result = self._ask_label(
+            "Новая метка", lambda n: core.check_label_name(self.labels, n),
+            color=core.next_label_color(self.labels))
+        if not result:
+            return
+        name, color = result
+        targets = [n for n, _p in self._selected()] if assign else []
+        try:
+            self.labels = core.add_label(self.root_dir, name, color)
+            if targets:
+                self.labels = core.set_account_label(self.root_dir, targets, name, True)
+        except SwitcherError as e:
+            messagebox.showerror("Метки", str(e), parent=self)
+        self._labels_changed()
+        if targets:
+            self.status.set(f"Метка «{name}» создана и поставлена: аккаунтов {len(targets)}")
+        else:
+            self.status.set(f"Метка «{name}» создана")
+
+    def edit_label(self, name: str) -> None:
+        old_color = self.labels["labels"].get(name)
+        if old_color is None:
+            return
+        result = self._ask_label(
+            "Изменить метку", lambda n: core.check_label_name(self.labels, n, ignore=name),
+            name, old_color)
+        if not result:
+            return
+        new_name, color = result
+        try:
+            if color != old_color:
+                self.labels = core.recolor_label(self.root_dir, name, color)
+            if new_name != name:
+                self.labels = core.rename_label(self.root_dir, name, new_name)
+                if name in self.filter_keys:
+                    self.filter_keys.discard(name)
+                    self.filter_keys.add(new_name)
+        except SwitcherError as e:
+            messagebox.showerror("Метки", str(e), parent=self)
+        self._labels_changed()
+
+    def delete_label(self, name: str) -> None:
+        used = self.label_counts().get(name, 0)
+        extra = f"\nОна будет снята с аккаунтов: {used}." if used else ""
+        if not messagebox.askyesno("Удалить метку", f"Удалить метку «{name}»?{extra}", parent=self):
+            return
+        try:
+            self.labels = core.remove_label(self.root_dir, name)
+        except SwitcherError as e:
+            messagebox.showerror("Метки", str(e), parent=self)
+        self._labels_changed()
+
+    def manage_labels(self) -> None:
+        if self.manager is not None and self.manager.winfo_exists():
+            self.manager.lift()
+            self.manager.focus_set()
+            return
+        self.manager = LabelManager(self)
 
     # ------------------------------------------------------------- запуск
 

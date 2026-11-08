@@ -113,6 +113,48 @@ def do_shortcuts(names: list[str], root: Path) -> int:
     return code
 
 
+def do_labels(args, root: Path) -> int:
+    """--label-add / --tag / --untag / --label-remove. Ошибки не прерывают остальные команды."""
+    code = 0
+    accounts = find_accounts(root)
+
+    def attempt(fn) -> None:
+        nonlocal code
+        try:
+            fn()
+        except SwitcherError as e:
+            report_error(str(e))
+            code = 1
+
+    for spec in args.label_add or []:
+        name, _, color = spec.partition("=")
+        attempt(lambda n=name, c=color: (
+            core.add_label(root, n, c or None),
+            _say(f"[+] Метка «{' '.join(n.split())}» создана")))
+    for acc, label in args.tag or []:
+        def tag(acc=acc, label=label):
+            real, _ = resolve_account(accounts, acc)
+            core.set_account_label(root, [real], label, True)
+            _say(f"[+] «{label}» → {real}")
+        attempt(tag)
+    for acc, label in args.untag or []:
+        def untag(acc=acc, label=label):
+            real, _ = resolve_account(accounts, acc)
+            core.set_account_label(root, [real], label, False)
+            _say(f"[+] «{label}» снята с {real}")
+        attempt(untag)
+    for label in args.label_remove or []:
+        attempt(lambda lb=label: (core.remove_label(root, lb), _say(f"[+] Метка «{lb}» удалена")))
+    return code
+
+
+def print_accounts(root: Path) -> None:
+    data = core.load_labels(root)
+    for i, (name, _p) in enumerate(find_accounts(root), 1):
+        mine = core.account_labels(data, name)
+        _say(f"{i:3}. {name}" + (f"   [{', '.join(mine)}]" if mine else ""))
+
+
 def do_run(query: str, root: Path) -> int:
     try:
         name, path = resolve_account(find_accounts(root), query)
@@ -140,10 +182,13 @@ def run_cli(root: Path) -> None:
         last = load_last()
 
         if accounts:
+            data = core.load_labels(root)
             print(f"\nНайдено аккаунтов: {len(accounts)}\n")
             for i, (name, _path) in enumerate(accounts, 1):
                 mark = "  ← last" if last and name == last else ""
-                print(f"  {i:3}. {name}{mark}")
+                mine = core.account_labels(data, name)
+                tags = f"  [{', '.join(mine)}]" if mine else ""
+                print(f"  {i:3}. {name}{tags}{mark}")
         else:
             print("\n[!] tdata не найдены.")
             print("    Ожидаемая структура:")
@@ -219,7 +264,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--shortcut", action="append", metavar="NAME",
                    help="создать ярлык аккаунта на рабочем столе (можно несколько раз)")
     p.add_argument("--shortcut-all", action="store_true", help="ярлыки для всех аккаунтов")
-    p.add_argument("--list", action="store_true", help="показать список аккаунтов")
+    p.add_argument("--list", action="store_true", help="показать список аккаунтов с метками")
+    p.add_argument("--label-add", action="append", metavar="NAME[=#цвет]",
+                   help="создать метку, напр. --label-add \"Работа=#539bf5\" (цвет необязателен)")
+    p.add_argument("--tag", nargs=2, action="append", metavar=("АККАУНТ", "МЕТКА"),
+                   help="поставить метку аккаунту")
+    p.add_argument("--untag", nargs=2, action="append", metavar=("АККАУНТ", "МЕТКА"),
+                   help="снять метку с аккаунта")
+    p.add_argument("--label-remove", action="append", metavar="МЕТКА", help="удалить метку")
     p.add_argument("--version", action="version", version=f"tdata-switcher {core.__version__}")
     return p
 
@@ -229,14 +281,16 @@ def main(argv: list[str] | None = None, default_mode: str = "gui") -> int:
     root_arg = args.root or args.root_pos
     root = Path(root_arg).expanduser().resolve() if root_arg else core.TDATA_ROOT
 
-    headless = bool(args.run or args.imports or args.shortcut or args.shortcut_all or args.list)
+    headless = bool(args.run or args.imports or args.shortcut or args.shortcut_all or args.list
+                    or args.label_add or args.tag or args.untag or args.label_remove)
     if headless:
         code = 0
         if args.imports:
             code |= do_import(args.imports, root, args.password)
+        if args.label_add or args.tag or args.untag or args.label_remove:
+            code |= do_labels(args, root)
         if args.list:
-            for i, (name, _p) in enumerate(find_accounts(root), 1):
-                _say(f"{i:3}. {name}")
+            print_accounts(root)
         if args.shortcut_all:
             code |= do_shortcuts([n for n, _ in find_accounts(root)], root)
         if args.shortcut:

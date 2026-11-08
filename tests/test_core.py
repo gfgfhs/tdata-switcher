@@ -255,6 +255,38 @@ class ShortcutTests(Base):
             core.create_shortcut("x", self.root, directory=self.tmp / "nope")
 
 
+class LabelCliTests(Base):
+    def run_cli(self, *argv):
+        import contextlib
+        import io
+        import tdata_switcher as cli
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(cli, "report_error") as err:
+            code = cli.main(["--root", str(self.root), *argv])
+        return code, out.getvalue(), [c.args[0] for c in err.call_args_list]
+
+    def test_label_commands(self):
+        make_tdata(self.root / "Ivan" / "tdata")
+        make_tdata(self.root / "Petr" / "tdata")
+        code, out, errs = self.run_cli("--label-add", "Работа=#539bf5", "--tag", "ivan", "Работа")
+        self.assertEqual((code, errs), (0, []))
+        code, out, _ = self.run_cli("--list")
+        self.assertIn("Ivan   [Работа]", out)
+        self.assertNotIn("Petr   [", out)
+        self.assertEqual(core.load_labels(self.root)["labels"]["Работа"], "#539bf5")
+        code, out, _ = self.run_cli("--untag", "Ivan", "Работа", "--label-remove", "Работа")
+        self.assertEqual(code, 0)
+        self.assertEqual(core.load_labels(self.root), {"labels": {}, "accounts": {}})
+
+    def test_errors_do_not_stop_other_commands(self):
+        make_tdata(self.root / "Ivan" / "tdata")
+        code, _out, errs = self.run_cli(
+            "--label-add", "A", "--tag", "ghost", "A", "--tag", "Ivan", "Nope", "--tag", "Ivan", "A")
+        self.assertEqual(code, 1)
+        self.assertEqual(len(errs), 2)  # аккаунт не найден + метки нет
+        self.assertEqual(core.load_labels(self.root)["accounts"], {"Ivan": ["A"]})
+
+
 class LaunchTests(Base):
     def test_launch_without_telegram(self):
         make_tdata(self.root / "a" / "tdata")
@@ -279,6 +311,120 @@ class LaunchTests(Base):
         s = core.load_settings()
         self.assertEqual(s["telegram"], "C:/x/Telegram.exe")
         self.assertEqual(s["last"], "acc")
+
+
+class LabelTests(Base):
+    def test_add_assign_and_persist(self):
+        core.add_label(self.root, "Работа", "#539BF5")
+        core.add_label(self.root, "Личные")  # цвет подбирается из палитры
+        core.set_account_label(self.root, ["Ivan", "Petr"], "Работа", True)
+        data = core.set_account_label(self.root, ["Ivan"], "Личные", True)
+        fresh = core.load_labels(self.root)  # читаем с диска заново
+        self.assertEqual(fresh, data)
+        self.assertEqual(fresh["labels"]["Работа"], "#539bf5")
+        self.assertEqual(core.account_labels(fresh, "Ivan"), ["Работа", "Личные"])
+        self.assertEqual(core.account_labels(fresh, "Petr"), ["Работа"])
+        self.assertEqual(core.account_labels(fresh, "Nobody"), [])
+        self.assertEqual(core.label_counts(fresh), {"Работа": 2, "Личные": 1})
+
+    def test_auto_colors_are_distinct_and_cycle(self):
+        for i in range(len(core.LABEL_PALETTE) + 2):
+            data = core.add_label(self.root, f"L{i}")
+        colors = list(data["labels"].values())
+        self.assertEqual(len(set(colors[:len(core.LABEL_PALETTE)])), len(core.LABEL_PALETTE))
+        self.assertEqual(len(colors), len(core.LABEL_PALETTE) + 2)  # палитра закончилась — по кругу
+
+    def test_unassign_and_empty_cleanup(self):
+        core.add_label(self.root, "A")
+        core.set_account_label(self.root, ["x"], "A", True)
+        data = core.set_account_label(self.root, ["x"], "A", False)
+        self.assertEqual(data["accounts"], {})
+
+    def test_assign_is_idempotent(self):
+        core.add_label(self.root, "A")
+        core.set_account_label(self.root, ["x"], "A", True)
+        data = core.set_account_label(self.root, ["x"], "A", True)
+        self.assertEqual(data["accounts"]["x"], ["A"])
+
+    def test_name_validation(self):
+        core.add_label(self.root, "Work")
+        for bad in ("", "   ", "work", "WORK", "x" * (core.LABEL_MAX_LEN + 1)):
+            with self.assertRaises(core.SwitcherError, msg=repr(bad)):
+                core.add_label(self.root, bad)
+        data = core.add_label(self.root, "  Two   words ")
+        self.assertIn("Two words", data["labels"])
+
+    def test_unknown_label_errors(self):
+        for fn in (lambda: core.remove_label(self.root, "nope"),
+                   lambda: core.recolor_label(self.root, "nope", "#fff"),
+                   lambda: core.rename_label(self.root, "nope", "x"),
+                   lambda: core.set_account_label(self.root, ["a"], "nope", True)):
+            with self.assertRaises(core.SwitcherError):
+                fn()
+
+    def test_remove_label_unassigns_everywhere(self):
+        core.add_label(self.root, "A")
+        core.add_label(self.root, "B")
+        core.set_account_label(self.root, ["x", "y"], "A", True)
+        core.set_account_label(self.root, ["y"], "B", True)
+        data = core.remove_label(self.root, "A")
+        self.assertEqual(data["accounts"], {"y": ["B"]})
+        self.assertEqual(list(data["labels"]), ["B"])
+
+    def test_rename_keeps_order_color_and_assignments(self):
+        core.add_label(self.root, "A", "#111111")
+        core.add_label(self.root, "B", "#222222")
+        core.set_account_label(self.root, ["x"], "A", True)
+        data = core.rename_label(self.root, "A", "Alpha")
+        self.assertEqual(list(data["labels"]), ["Alpha", "B"])
+        self.assertEqual(data["labels"]["Alpha"], "#111111")
+        self.assertEqual(data["accounts"]["x"], ["Alpha"])
+        with self.assertRaises(core.SwitcherError):  # занято другой меткой (без учёта регистра)
+            core.rename_label(self.root, "Alpha", "b")
+        data = core.rename_label(self.root, "Alpha", "ALPHA")  # смена регистра своей метки — можно
+        self.assertIn("ALPHA", data["labels"])
+
+    def test_recolor(self):
+        core.add_label(self.root, "A", "#111111")
+        data = core.recolor_label(self.root, "A", "#F00")
+        self.assertEqual(data["labels"]["A"], "#ff0000")
+
+    def test_normalize_color_and_contrast(self):
+        self.assertEqual(core.normalize_color("ABC"), "#aabbcc")
+        self.assertEqual(core.normalize_color(" #AABBCC "), "#aabbcc")
+        for bad in ("", "red", "#12", "#1234567", "#gggggg"):
+            with self.assertRaises(core.SwitcherError, msg=bad):
+                core.normalize_color(bad)
+        self.assertEqual(core.text_color_for("#ffffff"), "#000000")
+        self.assertEqual(core.text_color_for("#000000"), "#ffffff")
+        self.assertEqual(core.text_color_for("#e3b341"), "#000000")  # жёлтый — тёмный текст
+        self.assertEqual(core.text_color_for("#986ee2"), "#ffffff")  # фиолетовый — светлый
+
+    def test_corrupt_file_is_tolerated(self):
+        p = core.labels_path(self.root)
+        for junk in ("not json", "[]", '{"labels": 5, "accounts": 7}', ""):
+            p.write_text(junk, encoding="utf-8")
+            self.assertEqual(core.load_labels(self.root), {"labels": {}, "accounts": {}})
+
+    def test_partially_bad_data_is_cleaned(self):
+        core.labels_path(self.root).write_text(
+            '{"labels": {"A": "#abc", "B": "not-a-color", "": "#fff", "7": 1},'
+            ' "accounts": {"x": ["A", "A", "ghost", 3], "y": ["ghost"], "z": "A"}}',
+            encoding="utf-8")
+        data = core.load_labels(self.root)
+        self.assertEqual(data["labels"]["A"], "#aabbcc")
+        self.assertIn(data["labels"]["B"], core.LABEL_PALETTE)  # битый цвет заменён
+        self.assertNotIn("", data["labels"])
+        self.assertEqual(data["accounts"], {"x": ["A"]})  # дубли и неизвестные метки убраны
+
+    def test_find_accounts_ignores_labels_file(self):
+        make_tdata(self.root / "a" / "tdata")
+        core.add_label(self.root, "A")
+        self.assertEqual([n for n, _ in core.find_accounts(self.root)], ["a"])
+
+    def test_atomic_save_leaves_no_tmp(self):
+        core.add_label(self.root, "A")
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["labels.json"])
 
 
 if __name__ == "__main__":

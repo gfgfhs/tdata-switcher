@@ -642,3 +642,178 @@ def import_archive(
         return results
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------
+# Метки: цветные, назначаются любым аккаунтам. Хранятся в <root>/labels.json
+#   {"labels":   {"Работа": "#539bf5", ...},      ← порядок = порядок показа
+#    "accounts": {"Ivan": ["Работа", ...], ...}}
+# --------------------------------------------------------------------------
+
+LABELS_FILENAME = "labels.json"
+LABEL_MAX_LEN = 30
+LABEL_PALETTE = [
+    "#e5534b", "#f0883e", "#e3b341", "#57ab5a", "#39c5cf",
+    "#539bf5", "#986ee2", "#e275ad", "#8b949e", "#6cb6a0",
+]
+_HEX_COLOR = re.compile(r"#?([0-9a-fA-F]{3}|[0-9a-fA-F]{6})")
+
+
+def normalize_color(color: str) -> str:
+    """'#ABC' / 'abc' / '#AABBCC' → '#aabbcc'."""
+    m = _HEX_COLOR.fullmatch(str(color).strip())
+    if not m:
+        raise SwitcherError(f"Некорректный цвет: {color!r} (нужен вид #RRGGBB).")
+    h = m.group(1).lower()
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    return "#" + h
+
+
+def text_color_for(bg: str) -> str:
+    """Чёрный или белый текст — что читаемее на фоне bg (#rrggbb)."""
+    r, g, b = (int(bg[i:i + 2], 16) for i in (1, 3, 5))
+    return "#000000" if (0.299 * r + 0.587 * g + 0.114 * b) > 150 else "#ffffff"
+
+
+def labels_path(root: Path) -> Path:
+    return Path(root) / LABELS_FILENAME
+
+
+def load_labels(root: Path) -> dict:
+    """Читает метки; повреждённое/лишнее молча отбрасывает, чтобы файл никогда не ломал программу."""
+    data: dict = {"labels": {}, "accounts": {}}
+    try:
+        raw = json.loads(labels_path(root).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return data
+    if not isinstance(raw, dict):
+        return data
+    labels = raw.get("labels")
+    if isinstance(labels, dict):
+        for name, color in labels.items():
+            if not isinstance(name, str) or not name.strip():
+                continue
+            try:
+                data["labels"][name] = normalize_color(color)
+            except SwitcherError:
+                data["labels"][name] = LABEL_PALETTE[len(data["labels"]) % len(LABEL_PALETTE)]
+    accounts = raw.get("accounts")
+    if isinstance(accounts, dict):
+        for acc, names in accounts.items():
+            if not isinstance(acc, str) or not isinstance(names, list):
+                continue
+            seen: list[str] = []
+            for n in names:
+                if isinstance(n, str) and n in data["labels"] and n not in seen:
+                    seen.append(n)
+            if seen:
+                data["accounts"][acc] = seen
+    return data
+
+
+def _save_labels(root: Path, data: dict) -> None:
+    path = labels_path(root)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        Path(root).mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)  # атомарно: файл не останется наполовину записанным
+    except OSError as e:
+        raise SwitcherError(f"Не удалось сохранить метки: {e}") from e
+
+
+def check_label_name(data: dict, name: str, ignore: str | None = None) -> str:
+    """Возвращает очищенное имя метки или бросает SwitcherError (пусто, длинно, дубликат)."""
+    clean = " ".join(str(name).split())
+    if not clean:
+        raise SwitcherError("Название метки не может быть пустым.")
+    if len(clean) > LABEL_MAX_LEN:
+        raise SwitcherError(f"Название метки длиннее {LABEL_MAX_LEN} символов.")
+    for existing in data["labels"]:
+        if existing.lower() == clean.lower() and existing != ignore:
+            raise SwitcherError(f"Метка «{existing}» уже существует.")
+    return clean
+
+
+def next_label_color(data: dict) -> str:
+    """Первый ещё не занятый цвет палитры (когда все заняты — по кругу)."""
+    used = set(data["labels"].values())
+    for c in LABEL_PALETTE:
+        if c not in used:
+            return c
+    return LABEL_PALETTE[len(data["labels"]) % len(LABEL_PALETTE)]
+
+
+def add_label(root: Path, name: str, color: str | None = None) -> dict:
+    data = load_labels(root)
+    clean = check_label_name(data, name)
+    data["labels"][clean] = normalize_color(color) if color else next_label_color(data)
+    _save_labels(root, data)
+    return data
+
+
+def remove_label(root: Path, name: str) -> dict:
+    data = load_labels(root)
+    if name not in data["labels"]:
+        raise SwitcherError(f"Метки «{name}» нет.")
+    del data["labels"][name]
+    for acc in list(data["accounts"]):
+        data["accounts"][acc] = [n for n in data["accounts"][acc] if n != name]
+        if not data["accounts"][acc]:
+            del data["accounts"][acc]
+    _save_labels(root, data)
+    return data
+
+
+def recolor_label(root: Path, name: str, color: str) -> dict:
+    data = load_labels(root)
+    if name not in data["labels"]:
+        raise SwitcherError(f"Метки «{name}» нет.")
+    data["labels"][name] = normalize_color(color)
+    _save_labels(root, data)
+    return data
+
+
+def rename_label(root: Path, old: str, new: str) -> dict:
+    data = load_labels(root)
+    if old not in data["labels"]:
+        raise SwitcherError(f"Метки «{old}» нет.")
+    clean = check_label_name(data, new, ignore=old)
+    data["labels"] = {(clean if n == old else n): c for n, c in data["labels"].items()}
+    for acc, names in data["accounts"].items():
+        data["accounts"][acc] = [clean if n == old else n for n in names]
+    _save_labels(root, data)
+    return data
+
+
+def set_account_label(root: Path, accounts: list[str], label: str, present: bool) -> dict:
+    """Ставит (present=True) или снимает метку сразу у нескольких аккаунтов."""
+    data = load_labels(root)
+    if label not in data["labels"]:
+        raise SwitcherError(f"Метки «{label}» нет.")
+    for acc in accounts:
+        names = [n for n in data["accounts"].get(acc, []) if n != label]
+        if present:
+            names.append(label)
+        if names:
+            data["accounts"][acc] = names
+        else:
+            data["accounts"].pop(acc, None)
+    _save_labels(root, data)
+    return data
+
+
+def account_labels(data: dict, account: str) -> list[str]:
+    """Метки аккаунта в порядке, заданном списком меток."""
+    mine = set(data["accounts"].get(account, []))
+    return [n for n in data["labels"] if n in mine]
+
+
+def label_counts(data: dict) -> dict[str, int]:
+    counts = {n: 0 for n in data["labels"]}
+    for names in data["accounts"].values():
+        for n in names:
+            if n in counts:
+                counts[n] += 1
+    return counts
