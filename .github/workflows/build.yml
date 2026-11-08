@@ -38,13 +38,15 @@ jobs:
       - name: Install build dependencies
         run: pip install -r requirements.txt
       - name: Build GUI exe (no console window)
-        run: pyinstaller --onefile --windowed --clean --name tdata_switcher --hidden-import tdata_gui tdata_switcher.py
+        run: pyinstaller --onefile --windowed --clean --name tdata_switcher --hidden-import tdata_gui --collect-submodules opentele --collect-submodules telethon --hidden-import tgcrypto tdata_switcher.py
       - name: Build console exe
-        run: pyinstaller --onefile --console --clean --name tdata_switcher_cli tdata_switcher_cli.py
+        run: pyinstaller --onefile --console --clean --name tdata_switcher_cli --collect-submodules opentele --collect-submodules telethon --hidden-import tgcrypto tdata_switcher_cli.py
       - name: Smoke test
         shell: pwsh
         run: |
           .\dist\tdata_switcher_cli.exe --version
+          .\dist\tdata_switcher_cli.exe --check-session
+          if ($LASTEXITCODE -ne 0) { throw "opentele (.session support) is missing from the built exe" }
           New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\empty-root" | Out-Null
           .\dist\tdata_switcher_cli.exe --list --root "$env:RUNNER_TEMP\empty-root"
           if ($LASTEXITCODE -ne 0) { throw "tdata_switcher_cli.exe --list failed" }

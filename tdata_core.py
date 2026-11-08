@@ -17,19 +17,24 @@ tdata_core — общая логика tdata-switcher (без GUI и без вв
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import importlib.util
+import ipaddress
 import json
 import os
 import re
 import shutil
+import sqlite3
+import struct
 import subprocess
 import sys
 import uuid
 import zipfile
 from pathlib import Path
-from typing import Callable
+from typing import Callable, NamedTuple
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 IS_WINDOWS = sys.platform == "win32"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -817,3 +822,202 @@ def label_counts(data: dict) -> dict[str, int]:
             if n in counts:
                 counts[n] += 1
     return counts
+
+
+# --------------------------------------------------------------------------
+# Вход по .session (Telethon / Pyrogram) → tdata через opentele
+#
+# Режимы:
+#   "current" — берём ТОТ ЖЕ ключ авторизации (быстро). Но один ключ нельзя
+#               держать в двух клиентах одновременно: после конвертации не
+#               запускайте эту .session в Telethon/Pyrogram параллельно с
+#               Telegram Desktop, иначе Telegram может сбросить сессию.
+#   "new"     — по текущей сессии авторизуется НОВАЯ (QR-вход), исходная .session
+#               остаётся рабочей независимо. Если включена 2FA — нужен пароль.
+# --------------------------------------------------------------------------
+
+SESSION_SUFFIX = ".session"
+SESSION_TIMEOUT = 120  # секунд на всю конвертацию (сеть может подвисать)
+SESSION_MODES = ("current", "new")
+# адреса основных ДЦ Telegram (нужны только чтобы собрать StringSession из Pyrogram-ключа;
+# Telethon при подключении сам уточняет адрес по dc_id)
+_DC_ADDRESSES = {1: "149.154.175.53", 2: "149.154.167.51", 3: "149.154.175.100",
+                 4: "149.154.167.91", 5: "91.108.56.130"}
+_SESSION_DEAD = {
+    "AuthKeyUnregisteredError", "AuthKeyInvalidError", "AuthKeyDuplicatedError",
+    "UnauthorizedError", "SessionRevokedError", "SessionExpiredError",
+    "UserDeactivatedError", "UserDeactivatedBanError",
+}
+_INSTALL_HINT = (
+    "Для входа по .session нужна библиотека opentele (Python 3.10+): "
+    "pip install opentele-ng. В готовом .exe из Releases она уже встроена."
+)
+
+
+class SessionInfo(NamedTuple):
+    fmt: str            # "telethon" | "pyrogram"
+    dc_id: int
+    auth_key: bytes
+
+
+def is_session_file(path: Path) -> bool:
+    return Path(path).suffix.lower() == SESSION_SUFFIX
+
+
+def opentele_available() -> bool:
+    if "opentele" in sys.modules:
+        return True
+    try:
+        return importlib.util.find_spec("opentele") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def read_session_file(path: Path) -> SessionInfo:
+    """Определяет формат (Telethon/Pyrogram) и достаёт dc_id и ключ из sqlite-файла сессии."""
+    bad = SwitcherError("Это не файл сессии Telethon/Pyrogram.")
+    try:
+        con = sqlite3.connect(str(path))
+        try:
+            cols = {r[1] for r in con.execute("PRAGMA table_info(sessions)")}
+            if "server_address" in cols:
+                fmt = "telethon"
+                row = con.execute("SELECT dc_id, auth_key FROM sessions").fetchone()
+            elif "dc_id" in cols and "auth_key" in cols and ("user_id" in cols or "test_mode" in cols):
+                fmt = "pyrogram"
+                if "test_mode" in cols:
+                    row = con.execute("SELECT dc_id, auth_key, test_mode FROM sessions").fetchone()
+                    if row and row[2]:
+                        raise SwitcherError("Сессия тестового сервера Telegram не поддерживается.")
+                else:
+                    row = con.execute("SELECT dc_id, auth_key FROM sessions").fetchone()
+            else:
+                raise bad
+        finally:
+            con.close()
+    except sqlite3.DatabaseError as e:
+        raise bad from e
+    if not row or not row[1]:
+        raise SwitcherError("В сессии нет ключа авторизации (вход в аккаунт не был выполнен).")
+    dc_id, key = int(row[0]), bytes(row[1])
+    if len(key) != 256:
+        raise SwitcherError(f"Повреждённый ключ авторизации ({len(key)} байт вместо 256).")
+    return SessionInfo(fmt, dc_id, key)
+
+
+def build_string_session(dc_id: int, auth_key: bytes) -> str:
+    """Строка Telethon StringSession (формат: '1' + base64url(>B4sH256s)) — без импорта telethon."""
+    if dc_id not in _DC_ADDRESSES:
+        raise SwitcherError(f"Неизвестный дата-центр Telegram: {dc_id}.")
+    if len(auth_key) != 256:
+        raise SwitcherError("Ключ авторизации должен быть 256 байт.")
+    ip = ipaddress.ip_address(_DC_ADDRESSES[dc_id]).packed
+    return "1" + base64.urlsafe_b64encode(struct.pack(">B4sH256s", dc_id, ip, 443, auth_key)).decode("ascii")
+
+
+async def _convert_session(session_arg, mode: str, password: str | None, out_dir: Path) -> None:
+    from opentele.api import CreateNewSession, UseCurrentSession
+    from opentele.tl import TelegramClient
+
+    client = TelegramClient(session_arg)
+    try:
+        if mode == "new":
+            kwargs = {"password": password} if password else {}
+            tdesk = await client.ToTDesktop(flag=CreateNewSession, **kwargs)
+        else:
+            tdesk = await client.ToTDesktop(flag=UseCurrentSession)
+        tdesk.SaveTData(str(out_dir))
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+
+def _map_session_error(e: Exception) -> SwitcherError:
+    name = type(e).__name__
+    text = str(e)
+    low = text.lower()
+    if name == "SessionPasswordNeededError":
+        return PasswordRequired("Для новой сессии нужен пароль двухэтапной проверки (2FA).")
+    if name == "PasswordHashInvalidError" or "password_hash_invalid" in low:
+        return PasswordRequired("Неверный пароль двухэтапной проверки (2FA).")
+    if name in _SESSION_DEAD or "not authorized" in low or "unauthorized" in low:
+        return SwitcherError("Сессия недействительна: Telegram завершил её или аккаунт заблокирован.")
+    if isinstance(e, ImportError):
+        return SwitcherError(f"{_INSTALL_HINT} ({e})")
+    if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+        return SwitcherError("Превышено время ожидания ответа Telegram.")
+    if isinstance(e, OSError):
+        return SwitcherError(f"Нет связи с Telegram: {e}")
+    return SwitcherError(f"Не удалось сконвертировать сессию ({name}: {text})")
+
+
+def import_session(
+    session_path: Path,
+    root: Path,
+    name: str | None = None,
+    mode: str = "current",
+    password: str | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> tuple[str, Path]:
+    """
+    Конвертирует .session (Telethon или Pyrogram) в tdata и кладёт в root как <имя>/tdata/.
+    Имя по умолчанию — имя файла без расширения. Исходный файл не изменяется
+    (работаем с копией). Нужна сеть и установленный opentele(-ng).
+    """
+    session_path, root = Path(session_path), Path(root)
+    say = progress or (lambda _msg: None)
+    if mode not in SESSION_MODES:
+        raise SwitcherError(f"Неизвестный режим: {mode!r} (допустимо: current, new).")
+    if not session_path.is_file():
+        raise SwitcherError(f"Файл не найден: {session_path}")
+    if not opentele_available():
+        raise SwitcherError(_INSTALL_HINT)
+
+    root.mkdir(parents=True, exist_ok=True)
+    tmp = root / f".import_{uuid.uuid4().hex[:8]}"
+    tmp.mkdir()
+    try:
+        work = tmp / "work.session"
+        try:  # Telethon при открытии может писать в файл → работаем с копией
+            shutil.copy2(session_path, work)
+        except OSError as e:
+            raise SwitcherError(f"Не удалось прочитать {session_path.name}: {e}") from e
+        info = read_session_file(work)
+
+        if info.fmt == "pyrogram":
+            try:
+                from telethon.sessions import StringSession
+            except ImportError as e:
+                raise SwitcherError(f"{_INSTALL_HINT} ({e})") from e
+            session_arg = StringSession(build_string_session(info.dc_id, info.auth_key))
+        else:
+            session_arg = str(work)
+
+        say(f"Конвертация {session_path.name} ({info.fmt}, "
+            f"{'новая сессия' if mode == 'new' else 'текущая сессия'})…")
+        out = tmp / "out"
+        out.mkdir()
+
+        async def run() -> None:
+            await asyncio.wait_for(
+                _convert_session(session_arg, mode, password, out / "tdata"), SESSION_TIMEOUT)
+
+        try:
+            asyncio.run(run())
+        except SwitcherError:
+            raise
+        except Exception as e:  # noqa: BLE001 — сеть, Telegram и opentele бросают что угодно
+            raise _map_session_error(e) from e
+
+        found = find_tdata_dirs(out)
+        if not found:
+            raise SwitcherError("opentele не создал tdata (неожиданный результат конвертации).")
+        dest = _unique_dir(root, _safe_name(name or session_path.stem))
+        dest.mkdir()
+        shutil.move(str(found[0]), str(dest / "tdata"))
+        say(f"Импортирован: {dest.name}")
+        return dest.name, dest
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)

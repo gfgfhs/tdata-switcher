@@ -8,6 +8,8 @@ tdata-switcher — быстрый переключатель tdata + запус�
   tdata_switcher.py --cli                 текстовое меню
   tdata_switcher.py --run NAME            сразу запустить аккаунт (так работают ярлыки)
   tdata_switcher.py --import a.zip        импорт tdata из zip / rar / 7z (флаг можно повторять)
+  tdata_switcher.py --import acc.session  вход по .session Telethon/Pyrogram → tdata (opentele)
+                    [--new-session] [--2fa ПАРОЛЬ]
   tdata_switcher.py --shortcut NAME       ярлык на рабочий стол (--shortcut-all — для всех)
   tdata_switcher.py --list                список аккаунтов
   tdata_switcher.py [--root] "D:\\my_tdatas"   другая папка с аккаунтами
@@ -70,19 +72,28 @@ def _say(text: str) -> None:
 
 # ------------------------------------------------------------ действия без окна
 
-def do_import(archives: list[str], root: Path, password: str | None) -> int:
+def do_import(archives: list[str], root: Path, password: str | None,
+              session_mode: str = "current", twofa: str | None = None) -> int:
+    """Импорт архивов (zip/rar/7z) и файлов .session — тип определяется по расширению."""
     code = 0
     for raw in archives:
         archive = Path(raw.strip().strip('"')).expanduser()
-        pw = password
+        is_session = core.is_session_file(archive)
+        pw = twofa if is_session else password
         for _attempt in range(3):
             try:
-                res = import_archive(archive, root, password=pw, progress=_say)
-                _say(f"[+] {archive.name}: " + ", ".join(n for n, _ in res))
+                if is_session:
+                    name, _path = core.import_session(
+                        archive, root, mode=session_mode, password=pw, progress=_say)
+                    _say(f"[+] {archive.name}: {name}")
+                else:
+                    res = import_archive(archive, root, password=pw, progress=_say)
+                    _say(f"[+] {archive.name}: " + ", ".join(n for n, _ in res))
                 break
             except PasswordRequired:
                 if sys.stdin is None or not sys.stdin.isatty():
-                    report_error(f"{archive.name}: архив защищён паролем (используйте --password).")
+                    hint = "--2fa" if is_session else "--password"
+                    report_error(f"{archive.name}: нужен пароль (используйте {hint}).")
                     code = 1
                     break
                 import getpass
@@ -111,6 +122,23 @@ def do_shortcuts(names: list[str], root: Path) -> int:
             report_error(str(e))
             code = 1
     return code
+
+
+def check_session_support() -> int:
+    """0 — всё нужное для .session на месте (используется и в CI для проверки собранного exe)."""
+    try:
+        import telethon
+        import opentele
+        from opentele.api import CreateNewSession, UseCurrentSession  # noqa: F401
+        from opentele.td import TDesktop  # noqa: F401
+        from opentele.tl import TelegramClient  # noqa: F401
+    except Exception as e:  # noqa: BLE001
+        _say(f"[!] Поддержка .session недоступна: {type(e).__name__}: {e}")
+        _say("    Установите: pip install opentele-ng (нужен Python 3.10+)")
+        return 1
+    _say(f"[+] Поддержка .session: OK (opentele {getattr(opentele, '__version__', '?')}, "
+         f"telethon {getattr(telethon, '__version__', '?')})")
+    return 0
 
 
 def do_labels(args, root: Path) -> int:
@@ -258,9 +286,17 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--gui", action="store_true", help="открыть окно")
     mode.add_argument("--cli", action="store_true", help="текстовое меню")
     p.add_argument("--run", metavar="NAME", help="запустить аккаунт и выйти")
-    p.add_argument("--import", dest="imports", action="append", metavar="ARCHIVE",
-                   help="импортировать tdata из архива zip/rar/7z (можно несколько раз)")
+    p.add_argument("--import", dest="imports", action="append", metavar="FILE",
+                   help="импортировать архив zip/rar/7z или файл .session (Telethon/Pyrogram); "
+                        "можно несколько раз")
     p.add_argument("--password", help="пароль архива для --import")
+    p.add_argument("--new-session", action="store_true",
+                   help="для .session: создать НОВУЮ сессию (исходная .session останется рабочей); "
+                        "по умолчанию берётся тот же ключ")
+    p.add_argument("--2fa", dest="twofa", metavar="ПАРОЛЬ",
+                   help="пароль двухэтапной проверки аккаунта (для --new-session)")
+    p.add_argument("--check-session", action="store_true",
+                   help="проверить, что поддержка .session (opentele) доступна, и выйти")
     p.add_argument("--shortcut", action="append", metavar="NAME",
                    help="создать ярлык аккаунта на рабочем столе (можно несколько раз)")
     p.add_argument("--shortcut-all", action="store_true", help="ярлыки для всех аккаунтов")
@@ -281,12 +317,16 @@ def main(argv: list[str] | None = None, default_mode: str = "gui") -> int:
     root_arg = args.root or args.root_pos
     root = Path(root_arg).expanduser().resolve() if root_arg else core.TDATA_ROOT
 
+    if args.check_session:
+        return check_session_support()
+
     headless = bool(args.run or args.imports or args.shortcut or args.shortcut_all or args.list
                     or args.label_add or args.tag or args.untag or args.label_remove)
     if headless:
         code = 0
         if args.imports:
-            code |= do_import(args.imports, root, args.password)
+            code |= do_import(args.imports, root, args.password,
+                              "new" if args.new_session else "current", args.twofa)
         if args.label_add or args.tag or args.untag or args.label_remove:
             code |= do_labels(args, root)
         if args.list:
