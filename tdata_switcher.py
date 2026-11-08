@@ -2,7 +2,17 @@
 """
 tdata-switcher — быстрый переключатель tdata + запуск Telegram Portable
 
-Структура (любая из):
+Без аргументов открывается окно (GUI). Режимы командной строки:
+
+  tdata_switcher.py                       окно с аккаунтами
+  tdata_switcher.py --cli                 текстовое меню
+  tdata_switcher.py --run NAME            сразу запустить аккаунт (так работают ярлыки)
+  tdata_switcher.py --import a.zip        импорт tdata из zip / rar / 7z (флаг можно повторять)
+  tdata_switcher.py --shortcut NAME       ярлык на рабочий стол (--shortcut-all — для всех)
+  tdata_switcher.py --list                список аккаунтов
+  tdata_switcher.py [--root] "D:\\my_tdatas"   другая папка с аккаунтами
+
+Структура папки с аккаунтами (любая из):
   tdata/
     account1/tdata/          ← обычный вид
     account2/tdata/
@@ -14,255 +24,302 @@ tdata-switcher — быстрый переключатель tdata + запус�
 
 from __future__ import annotations
 
-import os
+import argparse
+import re
 import sys
-import subprocess
-import json
 import time
 from pathlib import Path
 
-# ============== БАЗОВАЯ ПАПКА ==============
-# При сборке в .exe (PyInstaller --onefile) __file__ указывает во временную
-# папку _MEI..., поэтому берём папку, где лежит сам exe.
-if getattr(sys, "frozen", False):
-    BASE_DIR = Path(sys.executable).resolve().parent
-else:
-    BASE_DIR = Path(__file__).resolve().parent
-
-# ============== НАСТРОЙКИ ==============
-TDATA_ROOT = BASE_DIR / "tdata"
-TELEGRAM_EXE = BASE_DIR / "Telegram" / "Telegram.exe"
-# =======================================
-
-
-def is_tdata_content(path: Path) -> bool:
-    """Проверяет, что папка содержит файлы tdata (key_datas / hex)."""
-    if not path.is_dir():
-        return False
-    names = {p.name for p in path.iterdir()}
-    if "key_datas" in names or "key_data" in names:
-        return True
-    hex_count = sum(
-        1 for n in names
-        if len(n) >= 16 and all(c in "0123456789ABCDEFabcdef" for c in n)
-    )
-    return hex_count >= 1
+import tdata_core as core
+from tdata_core import (
+    PasswordRequired,
+    SwitcherError,
+    create_shortcut,
+    find_accounts,
+    import_archive,
+    launch,
+    load_last,
+    resolve_account,
+)
 
 
-def find_accounts(root: Path) -> list[tuple[str, Path]]:
-    """
-    Возвращает список (красивое_имя, путь_к_папке_которая_содержит_tdata_или_является_tdata).
-    """
-    results: list[tuple[str, Path]] = []
-    seen = set()
+# ----------------------------------------------------------------- вывод ошибок
 
-    if not root.exists():
-        return results
-
-    def add(name: str, workdir: Path):
-        workdir = workdir.resolve()
-        if workdir in seen:
-            return
-        seen.add(workdir)
-        results.append((name, workdir))
-
-    # 1. Сама root — tdata content?
-    if is_tdata_content(root):
-        add(root.name, root)
-        return results
-
-    for item in sorted(root.iterdir()):
-        if not item.is_dir():
-            continue
-
-        # item/tdata  (классика)
-        nested = item / "tdata"
-        if nested.is_dir() and is_tdata_content(nested):
-            add(item.name, item)
-            continue
-
-        # item сам = tdata content (без вложенной tdata)
-        if is_tdata_content(item):
-            add(item.name, item)
-            continue
-
-        # глубже: item/*/tdata
-        for child in item.iterdir():
-            if child.is_dir() and child.name.lower() == "tdata" and is_tdata_content(child):
-                add(f"{item.name}/{child.parent.name}", child.parent)
-            elif child.is_dir() and is_tdata_content(child):
-                add(f"{item.name}/{child.name}", child)
-
-    return results
+def report_error(message: str) -> None:
+    """В консоль, если она есть; иначе (оконный exe, ярлык) — диалогом."""
+    stderr = sys.stderr
+    if stderr is not None and stderr.isatty():
+        print(f"[!] {message}", file=stderr)
+        return
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        win = tk.Tk()
+        win.withdraw()
+        messagebox.showerror("tdata-switcher", message, parent=win)
+        win.destroy()
+    except Exception:
+        if stderr is not None:
+            print(f"[!] {message}", file=stderr)
 
 
-def ensure_workdir_has_tdata(account_path: Path) -> Path:
-    """
-    Telegram требует, чтобы в -workdir была подпапка tdata.
-    Если account_path уже содержит tdata/ — возвращаем его.
-    Если account_path сам является содержимым tdata — создаём рядом временную
-    структуру через junction (Windows) / symlink.
-    """
-    if (account_path / "tdata").is_dir() and is_tdata_content(account_path / "tdata"):
-        return account_path
+def _say(text: str) -> None:
+    if sys.stdout is not None:
+        print(text)
 
-    if is_tdata_content(account_path):
-        # Нужно, чтобы workdir/tdata указывал на account_path
-        work_base = BASE_DIR / "_workdirs"
-        work_base.mkdir(exist_ok=True)
-        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in account_path.name)[:40]
-        wd = work_base / safe
-        tdata_link = wd / "tdata"
 
-        if tdata_link.exists():
+# ------------------------------------------------------------ действия без окна
+
+def do_import(archives: list[str], root: Path, password: str | None) -> int:
+    code = 0
+    for raw in archives:
+        archive = Path(raw.strip().strip('"')).expanduser()
+        pw = password
+        for _attempt in range(3):
             try:
-                if tdata_link.resolve() == account_path.resolve():
-                    return wd
-            except Exception:
-                pass
-            if tdata_link.is_symlink() or tdata_link.is_dir():
-                try:
-                    tdata_link.unlink()
-                except Exception:
-                    import shutil
-                    shutil.rmtree(tdata_link, ignore_errors=True)
-
-        wd.mkdir(parents=True, exist_ok=True)
-
-        if sys.platform == "win32":
-            r = subprocess.run(
-                ["cmd", "/c", "mklink", "/J", str(tdata_link), str(account_path)],
-                capture_output=True, text=True
-            )
-            if r.returncode != 0:
-                print(f"[!] Не удалось создать junction: {r.stderr}")
-                return account_path.parent
+                res = import_archive(archive, root, password=pw, progress=_say)
+                _say(f"[+] {archive.name}: " + ", ".join(n for n, _ in res))
+                break
+            except PasswordRequired:
+                if sys.stdin is None or not sys.stdin.isatty():
+                    report_error(f"{archive.name}: архив защищён паролем (используйте --password).")
+                    code = 1
+                    break
+                import getpass
+                pw = getpass.getpass(f"Пароль для {archive.name} (пусто = пропустить): ") or None
+                if pw is None:
+                    code = 1
+                    break
+            except SwitcherError as e:
+                report_error(f"{archive.name}: {e}")
+                code = 1
+                break
         else:
-            tdata_link.symlink_to(account_path, target_is_directory=True)
-
-        return wd
-
-    return account_path
+            report_error(f"{archive.name}: неверный пароль")
+            code = 1
+    return code
 
 
-def find_telegram() -> Path | None:
-    candidates = [
-        TELEGRAM_EXE,
-        BASE_DIR / "Telegram.exe",
-        Path(os.environ.get("APPDATA", "")) / "Telegram Desktop" / "Telegram.exe",
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Telegram Desktop" / "Telegram.exe",
-    ]
-    for c in candidates:
-        if c and Path(c).exists():
-            return Path(c)
-    for p in BASE_DIR.rglob("Telegram.exe"):
-        return p
-    return None
-
-
-def load_last() -> str | None:
-    cfg = BASE_DIR / "last_account.json"
-    if cfg.exists():
+def do_shortcuts(names: list[str], root: Path) -> int:
+    accounts = find_accounts(root)
+    code = 0
+    for query in names:
         try:
-            return json.loads(cfg.read_text(encoding="utf-8")).get("last")
-        except Exception:
-            pass
-    return None
+            name, _ = resolve_account(accounts, query)
+            _say(f"[+] Ярлык: {create_shortcut(name, root)}")
+        except SwitcherError as e:
+            report_error(str(e))
+            code = 1
+    return code
 
 
-def save_last(name: str):
-    cfg = BASE_DIR / "last_account.json"
-    cfg.write_text(json.dumps({"last": name}, ensure_ascii=False, indent=2), encoding="utf-8")
+def do_labels(args, root: Path) -> int:
+    """--label-add / --tag / --untag / --label-remove. Ошибки не прерывают остальные команды."""
+    code = 0
+    accounts = find_accounts(root)
+
+    def attempt(fn) -> None:
+        nonlocal code
+        try:
+            fn()
+        except SwitcherError as e:
+            report_error(str(e))
+            code = 1
+
+    for spec in args.label_add or []:
+        name, _, color = spec.partition("=")
+        attempt(lambda n=name, c=color: (
+            core.add_label(root, n, c or None),
+            _say(f"[+] Метка «{' '.join(n.split())}» создана")))
+    for acc, label in args.tag or []:
+        def tag(acc=acc, label=label):
+            real, _ = resolve_account(accounts, acc)
+            core.set_account_label(root, [real], label, True)
+            _say(f"[+] «{label}» → {real}")
+        attempt(tag)
+    for acc, label in args.untag or []:
+        def untag(acc=acc, label=label):
+            real, _ = resolve_account(accounts, acc)
+            core.set_account_label(root, [real], label, False)
+            _say(f"[+] «{label}» снята с {real}")
+        attempt(untag)
+    for label in args.label_remove or []:
+        attempt(lambda lb=label: (core.remove_label(root, lb), _say(f"[+] Метка «{lb}» удалена")))
+    return code
 
 
-def main():
+def print_accounts(root: Path) -> None:
+    data = core.load_labels(root)
+    for i, (name, _p) in enumerate(find_accounts(root), 1):
+        mine = core.account_labels(data, name)
+        _say(f"{i:3}. {name}" + (f"   [{', '.join(mine)}]" if mine else ""))
+
+
+def do_run(query: str, root: Path) -> int:
+    try:
+        name, path = resolve_account(find_accounts(root), query)
+        launch(name, path)
+        return 0
+    except SwitcherError as e:
+        report_error(str(e))
+        return 1
+
+
+# ------------------------------------------------------------------ CLI-меню
+
+def run_cli(root: Path) -> None:
     print("=" * 52)
     print("  tdata-switcher  ·  быстрый запуск Portable")
     print("=" * 52)
-
-    root = TDATA_ROOT
-    if len(sys.argv) > 1:
-        root = Path(sys.argv[1]).expanduser().resolve()
-
     print(f"\nПапка с аккаунтами: {root}")
 
     if not root.exists():
         root.mkdir(parents=True, exist_ok=True)
-        print(f"[!] Папка создана. Положи туда tdata-папки и запусти снова.")
-        input("\nEnter...")
+        print("[!] Папка создана. Положи туда tdata-папки (или импортируй архив) и запусти снова.")
+
+    while True:
+        accounts = find_accounts(root)
+        last = load_last()
+
+        if accounts:
+            data = core.load_labels(root)
+            print(f"\nНайдено аккаунтов: {len(accounts)}\n")
+            for i, (name, _path) in enumerate(accounts, 1):
+                mark = "  ← last" if last and name == last else ""
+                mine = core.account_labels(data, name)
+                tags = f"  [{', '.join(mine)}]" if mine else ""
+                print(f"  {i:3}. {name}{tags}{mark}")
+        else:
+            print("\n[!] tdata не найдены.")
+            print("    Ожидаемая структура:")
+            print("      tdata/account1/tdata/   или   tdata/account1/  (с key_datas)")
+
+        print("\n  i — импорт архива (zip/rar/7z)   s N — ярлык на рабочий стол   q — выход")
+        choice = input("Номер (Enter = последний): ").strip()
+        low = choice.lower()
+
+        if low in ("q", "quit", "exit"):
+            return
+
+        if low == "i" or low.startswith("i "):
+            path = choice[1:].strip() or input("Путь к архиву: ").strip()
+            if path:
+                do_import([path], root, None)
+            continue
+
+        m = re.fullmatch(r"s\s*(\d+)", low)
+        if m:
+            idx = int(m.group(1))
+            if 1 <= idx <= len(accounts):
+                try:
+                    print(f"[+] Ярлык: {create_shortcut(accounts[idx - 1][0], root)}")
+                except SwitcherError as e:
+                    print(f"[!] {e}")
+            else:
+                print("[!] Неверный номер")
+            continue
+
+        selected = None
+        if not choice and last:
+            selected = next((a for a in accounts if a[0] == last), None)
+        elif choice.isdigit() and 1 <= int(choice) <= len(accounts):
+            selected = accounts[int(choice) - 1]
+
+        if selected is None:
+            print("[!] Неверный выбор")
+            continue
+
+        name, path = selected
+        try:
+            tg = core.find_telegram()
+            print(f"\n[+] Запускаю «{name}»")
+            if tg:
+                print(f"    {tg.name}  -workdir  {core.ensure_workdir_has_tdata(path)}")
+            launch(name, path, telegram=tg)
+            print("[+] Готово")
+        except SwitcherError as e:
+            print(f"\n[!] {e}")
+            input("\nEnter...")
+            return
+        if getattr(sys, "frozen", False):
+            time.sleep(1.2)
         return
 
-    accounts = find_accounts(root)
-    if not accounts:
-        print("[!] tdata не найдены.")
-        print("    Ожидаемая структура:")
-        print("      tdata/account1/tdata/   или   tdata/account1/  (с key_datas)")
-        input("\nEnter...")
-        return
 
-    last = load_last()
+# ------------------------------------------------------------------- main
 
-    print(f"\nНайдено аккаунтов: {len(accounts)}\n")
-    for i, (name, path) in enumerate(accounts, 1):
-        mark = "  ← last" if last and name == last else ""
-        print(f"  {i:3}. {name}{mark}")
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="tdata_switcher", description="Быстрый переключатель tdata + запуск Telegram Portable")
+    p.add_argument("root_pos", nargs="?", metavar="ROOT",
+                   help="папка с аккаунтами (по умолчанию tdata/ рядом с программой)")
+    p.add_argument("--root", help="папка с аккаунтами")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--gui", action="store_true", help="открыть окно")
+    mode.add_argument("--cli", action="store_true", help="текстовое меню")
+    p.add_argument("--run", metavar="NAME", help="запустить аккаунт и выйти")
+    p.add_argument("--import", dest="imports", action="append", metavar="ARCHIVE",
+                   help="импортировать tdata из архива zip/rar/7z (можно несколько раз)")
+    p.add_argument("--password", help="пароль архива для --import")
+    p.add_argument("--shortcut", action="append", metavar="NAME",
+                   help="создать ярлык аккаунта на рабочем столе (можно несколько раз)")
+    p.add_argument("--shortcut-all", action="store_true", help="ярлыки для всех аккаунтов")
+    p.add_argument("--list", action="store_true", help="показать список аккаунтов с метками")
+    p.add_argument("--label-add", action="append", metavar="NAME[=#цвет]",
+                   help="создать метку, напр. --label-add \"Работа=#539bf5\" (цвет необязателен)")
+    p.add_argument("--tag", nargs=2, action="append", metavar=("АККАУНТ", "МЕТКА"),
+                   help="поставить метку аккаунту")
+    p.add_argument("--untag", nargs=2, action="append", metavar=("АККАУНТ", "МЕТКА"),
+                   help="снять метку с аккаунта")
+    p.add_argument("--label-remove", action="append", metavar="МЕТКА", help="удалить метку")
+    p.add_argument("--version", action="version", version=f"tdata-switcher {core.__version__}")
+    return p
 
-    print()
-    choice = input("Номер (Enter = последний): ").strip()
 
-    selected_name = None
-    selected_path = None
+def main(argv: list[str] | None = None, default_mode: str = "gui") -> int:
+    args = build_parser().parse_args(argv)
+    root_arg = args.root or args.root_pos
+    root = Path(root_arg).expanduser().resolve() if root_arg else core.TDATA_ROOT
 
-    if not choice and last:
-        for name, path in accounts:
-            if name == last:
-                selected_name, selected_path = name, path
-                break
-    elif choice.isdigit():
-        idx = int(choice)
-        if 1 <= idx <= len(accounts):
-            selected_name, selected_path = accounts[idx - 1]
+    headless = bool(args.run or args.imports or args.shortcut or args.shortcut_all or args.list
+                    or args.label_add or args.tag or args.untag or args.label_remove)
+    if headless:
+        code = 0
+        if args.imports:
+            code |= do_import(args.imports, root, args.password)
+        if args.label_add or args.tag or args.untag or args.label_remove:
+            code |= do_labels(args, root)
+        if args.list:
+            print_accounts(root)
+        if args.shortcut_all:
+            code |= do_shortcuts([n for n, _ in find_accounts(root)], root)
+        if args.shortcut:
+            code |= do_shortcuts(args.shortcut, root)
+        if args.run:
+            code |= do_run(args.run, root)
+        return code
 
-    if selected_path is None:
-        print("[!] Неверный выбор")
-        input("\nEnter...")
-        return
+    mode = "cli" if args.cli else "gui" if args.gui else default_mode
+    if mode == "gui":
+        try:
+            from tdata_gui import run_gui
+        except ImportError:
+            print("[!] tkinter недоступен — открываю текстовое меню.")
+            mode = "cli"
+        else:
+            run_gui(root)
+            return 0
 
-    save_last(selected_name)
-    workdir = ensure_workdir_has_tdata(selected_path)
-
-    tg = find_telegram()
-    if not tg:
-        print(f"\n[!] Telegram.exe не найден.")
-        print(f"    Положи Portable в папку:  {BASE_DIR / 'Telegram'}")
-        print(f"    (должен быть Telegram/Telegram.exe)")
-        print(f"\nworkdir: {workdir}")
-        input("\nEnter...")
-        return
-
-    print(f"\n[+] Запускаю «{selected_name}»")
-    print(f"    {tg.name}  -workdir  {workdir}")
-
-    try:
-        flags = subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0
-        subprocess.Popen(
-            [str(tg), "-workdir", str(workdir.resolve())],
-            cwd=str(tg.parent),
-            creationflags=flags,
-        )
-        print("[+] Готово")
-    except Exception as e:
-        print(f"[!] Ошибка: {e}")
-
-    if getattr(sys, "frozen", False):
-        time.sleep(1.2)
+    run_cli(root)
+    return 0
 
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main())
     except KeyboardInterrupt:
         print("\nОтмена")
     except Exception as e:
-        print(f"\n[!] {type(e).__name__}: {e}")
-        input("\nEnter...")
+        report_error(f"{type(e).__name__}: {e}")
+        if sys.stdin is not None and sys.stdin.isatty():
+            input("\nEnter...")

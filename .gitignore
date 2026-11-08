@@ -1,0 +1,20 @@
+# --- Данные аккаунтов: НИКОГДА не коммитить (tdata = полный доступ к аккаунту) ---
+/tdata/
+/_workdirs/
+/last_account.json
+/Telegram/
+*.session
+key_datas
+
+# --- Сборка ---
+/build/
+/dist/
+*.spec
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
