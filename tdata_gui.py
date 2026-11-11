@@ -13,7 +13,7 @@ import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 
 import tdata_core as core
-from tdata_core import PasswordRequired, SwitcherError, TelegramNotFound
+from tdata_core import PasswordRequired, SwitcherError, TelegramNotFound, tdata_content_dir, validate_tdata
 
 SWATCH = 12        # размер цветного квадратика, px
 STRIP_MAX = 5      # сколько квадратиков меток показываем в строке списка
@@ -418,8 +418,13 @@ class App(tk.Tk):
             colors = [self.labels["labels"][m] for m in mine]
             iid = str(idx)
             self.shown[iid] = acc
+            status_parts = []
+            if validate_tdata(tdata_content_dir(acc[1])):
+                status_parts.append("⚠")
+            if name == last:
+                status_parts.append("последний")
             self.tree.insert("", "end", iid=iid, text=name, image=self._strip(colors),
-                             values=(", ".join(mine), "последний" if name == last else ""))
+                             values=(", ".join(mine), " ".join(status_parts)))
             if name in keep:
                 to_select.append(iid)
         if not to_select:
@@ -521,6 +526,7 @@ class App(tk.Tk):
         menu.add_command(label="Запустить", command=self.launch_selected)
         menu.add_cascade(label="Метки", menu=self._build_label_menu(menu))
         menu.add_command(label="Ярлык на рабочий стол", command=self.make_shortcuts)
+        menu.add_command(label="Проверить tdata", command=self.check_selected)
         menu.add_command(label="Открыть папку аккаунта", command=self.open_account_folder)
         self._popup_menu = menu
         try:
@@ -634,6 +640,28 @@ class App(tk.Tk):
         self._fill()
         if self.close_var.get():
             self.after(600, self.destroy)
+
+    # ------------------------------------------------------------ проверка
+
+    def check_selected(self) -> None:
+        sel = self._selected()
+        if not sel:
+            self.status.set("Выберите аккаунт в списке")
+            return
+        lines = []
+        broken = 0
+        for name, path in sel:
+            problems = validate_tdata(tdata_content_dir(path))
+            if problems:
+                broken += 1
+                lines.append(f"{name}:\n  - " + "\n  - ".join(problems))
+            else:
+                lines.append(f"{name}: OK")
+        if broken:
+            messagebox.showwarning("Проверка tdata", "\n\n".join(lines), parent=self)
+        else:
+            messagebox.showinfo("Проверка tdata", "\n\n".join(lines), parent=self)
+        self.status.set(f"Проверено: {len(sel)}, с проблемами: {broken}")
 
     # ------------------------------------------------------------- ярлыки
 

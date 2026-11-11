@@ -29,7 +29,7 @@ import zipfile
 from pathlib import Path
 from typing import Callable
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 IS_WINDOWS = sys.platform == "win32"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -113,6 +113,19 @@ def is_tdata_content(path: Path) -> bool:
     return hex_count >= 1
 
 
+def tdata_content_dir(account_path: Path) -> Path:
+    """
+    find_accounts/resolve_account возвращают папку аккаунта, которая бывает сама
+    содержимым tdata ИЛИ содержит вложенную tdata/ — эта функция достаёт ту,
+    что реально содержит key_datas/hex-папки, для проверки и для ensure_workdir.
+    """
+    account_path = Path(account_path)
+    nested = account_path / "tdata"
+    if nested.is_dir() and is_tdata_content(nested):
+        return nested
+    return account_path
+
+
 def find_accounts(root: Path) -> list[tuple[str, Path]]:
     """
     Возвращает список (красивое_имя, путь_к_папке_которая_содержит_tdata_или_является_tdata).
@@ -162,6 +175,71 @@ def find_accounts(root: Path) -> list[tuple[str, Path]]:
     return results
 
 
+_HEX_NAME = re.compile(r"^[0-9A-Fa-f]{16,}$")
+_MAP_NAMES = ("map0", "map1", "map")
+_MIN_KEY_DATAS_SIZE = 16  # ключи реально на несколько сотен байт; меньше — явно обрезано/битое
+
+
+def validate_tdata(path: Path) -> list[str]:
+    """
+    Проверяет папку tdata на целостность по структуре (без расшифровки — ключи
+    защищены паролем/DPAPI, и это не входит в задачу). Возвращает список понятных
+    проблем; пустой список — структура в порядке (это не гарантия, что сам Telegram
+    примет файлы, только что они на месте, не пустые и не обрезаны).
+    """
+    path = Path(path)
+    if not path.is_dir():
+        return [f"Папка не найдена: {path}"]
+
+    try:
+        entries = {p.name: p for p in path.iterdir()}
+    except OSError as e:
+        return [f"Не удалось прочитать папку: {e}"]
+
+    key_datas = entries.get("key_datas") or entries.get("key_data")
+    hex_dirs = sorted(p for n, p in entries.items() if p.is_dir() and _HEX_NAME.fullmatch(n))
+
+    if key_datas is None and not hex_dirs:
+        return ["Не похоже на tdata: нет ни key_datas, ни hex-папки аккаунта."]
+
+    problems: list[str] = []
+
+    if key_datas is None:
+        problems.append("Нет key_datas (ключи шифрования) — без него Telegram не откроет аккаунт.")
+    else:
+        try:
+            size = key_datas.stat().st_size
+        except OSError as e:
+            problems.append(f"key_datas: не удалось прочитать ({e}).")
+            size = None
+        if size == 0:
+            problems.append("key_datas пустой — ключи не сохранены или повреждены.")
+        elif size is not None and size < _MIN_KEY_DATAS_SIZE:
+            problems.append(f"key_datas подозрительно маленький ({size} байт) — возможно, обрезан.")
+
+    if not hex_dirs:
+        problems.append("Нет hex-папки аккаунта (данные сессии) рядом с key_datas.")
+    for hd in hex_dirs:
+        try:
+            names = {p.name: p for p in hd.iterdir()}
+        except OSError as e:
+            problems.append(f"{hd.name}: не удалось прочитать ({e}).")
+            continue
+        maps = [names[n] for n in _MAP_NAMES if n in names]
+        if not maps:
+            problems.append(f"{hd.name}: нет map0/map1 — профиль пуст или повреждён.")
+            continue
+        empty = [m.name for m in maps if m.stat().st_size == 0]
+        if empty:
+            problems.append(f"{hd.name}: {', '.join(empty)} пустой — профиль повреждён.")
+
+    return problems
+
+
+def is_tdata_valid(path: Path) -> bool:
+    return not validate_tdata(path)
+
+
 def resolve_account(accounts: list[tuple[str, Path]], query: str) -> tuple[str, Path]:
     """Находит аккаунт по имени: точно, без регистра, по началу/подстроке или по номеру."""
     q = query.strip()
@@ -196,7 +274,7 @@ def ensure_workdir_has_tdata(account_path: Path) -> Path:
     Если account_path сам является содержимым tdata — создаём рядом временную
     структуру через junction (Windows) / symlink.
     """
-    if (account_path / "tdata").is_dir() and is_tdata_content(account_path / "tdata"):
+    if tdata_content_dir(account_path) == account_path / "tdata":
         return account_path
 
     if is_tdata_content(account_path):

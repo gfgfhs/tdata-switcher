@@ -9,7 +9,8 @@ tdata-switcher — быстрый переключатель tdata + запус�
   tdata_switcher.py --run NAME            сразу запустить аккаунт (так работают ярлыки)
   tdata_switcher.py --import a.zip        импорт tdata из zip / rar / 7z (флаг можно повторять)
   tdata_switcher.py --shortcut NAME       ярлык на рабочий стол (--shortcut-all — для всех)
-  tdata_switcher.py --list                список аккаунтов
+  tdata_switcher.py --list --check        список аккаунтов (с отметкой повреждённых)
+  tdata_switcher.py --validate [NAME...]  проверить tdata на целостность (без имён — все)
   tdata_switcher.py [--root] "D:\\my_tdatas"   другая папка с аккаунтами
 
 Структура папки с аккаунтами (любая из):
@@ -40,6 +41,8 @@ from tdata_core import (
     launch,
     load_last,
     resolve_account,
+    tdata_content_dir,
+    validate_tdata,
 )
 
 
@@ -79,6 +82,11 @@ def do_import(archives: list[str], root: Path, password: str | None) -> int:
             try:
                 res = import_archive(archive, root, password=pw, progress=_say)
                 _say(f"[+] {archive.name}: " + ", ".join(n for n, _ in res))
+                for name, path in res:
+                    problems = validate_tdata(tdata_content_dir(path))
+                    if problems:
+                        _say(f"    [!] {name}: похоже, импортировано с проблемами — "
+                             f"{problems[0]}" + (f" (+{len(problems) - 1})" if len(problems) > 1 else ""))
                 break
             except PasswordRequired:
                 if sys.stdin is None or not sys.stdin.isatty():
@@ -148,11 +156,44 @@ def do_labels(args, root: Path) -> int:
     return code
 
 
-def print_accounts(root: Path) -> None:
+def print_accounts(root: Path, check: bool = False) -> None:
     data = core.load_labels(root)
-    for i, (name, _p) in enumerate(find_accounts(root), 1):
+    for i, (name, path) in enumerate(find_accounts(root), 1):
         mine = core.account_labels(data, name)
-        _say(f"{i:3}. {name}" + (f"   [{', '.join(mine)}]" if mine else ""))
+        tags = f"   [{', '.join(mine)}]" if mine else ""
+        mark = ""
+        if check:
+            problems = validate_tdata(tdata_content_dir(path))
+            mark = "   [+] OK" if not problems else f"   [!] проблем: {len(problems)}"
+        _say(f"{i:3}. {name}{tags}{mark}")
+
+
+def do_validate(names: list[str], root: Path) -> int:
+    """--validate без имён проверяет все аккаунты; с именами — только указанные."""
+    accounts = find_accounts(root)
+    targets = accounts
+    code = 0
+    if names:
+        targets = []
+        for query in names:
+            try:
+                targets.append(resolve_account(accounts, query))
+            except SwitcherError as e:
+                report_error(str(e))
+                code = 1
+    if not targets and not names:
+        _say("[!] Аккаунтов нет.")
+        return code
+    for name, path in targets:
+        problems = validate_tdata(tdata_content_dir(path))
+        if problems:
+            code = 1
+            _say(f"[!] {name}: есть проблемы")
+            for p in problems:
+                _say(f"      - {p}")
+        else:
+            _say(f"[+] {name}: OK")
+    return code
 
 
 def do_run(query: str, root: Path) -> int:
@@ -184,17 +225,19 @@ def run_cli(root: Path) -> None:
         if accounts:
             data = core.load_labels(root)
             print(f"\nНайдено аккаунтов: {len(accounts)}\n")
-            for i, (name, _path) in enumerate(accounts, 1):
+            for i, (name, path) in enumerate(accounts, 1):
                 mark = "  ← last" if last and name == last else ""
                 mine = core.account_labels(data, name)
                 tags = f"  [{', '.join(mine)}]" if mine else ""
-                print(f"  {i:3}. {name}{tags}{mark}")
+                warn = "  ⚠ повреждён" if validate_tdata(tdata_content_dir(path)) else ""
+                print(f"  {i:3}. {name}{tags}{warn}{mark}")
         else:
             print("\n[!] tdata не найдены.")
             print("    Ожидаемая структура:")
             print("      tdata/account1/tdata/   или   tdata/account1/  (с key_datas)")
 
-        print("\n  i — импорт архива (zip/rar/7z)   s N — ярлык на рабочий стол   q — выход")
+        print("\n  i — импорт архива (zip/rar/7z)   s N — ярлык на рабочий стол"
+              "   v N — проверить tdata   q — выход")
         choice = input("Номер (Enter = последний): ").strip()
         low = choice.lower()
 
@@ -215,6 +258,22 @@ def run_cli(root: Path) -> None:
                     print(f"[+] Ярлык: {create_shortcut(accounts[idx - 1][0], root)}")
                 except SwitcherError as e:
                     print(f"[!] {e}")
+            else:
+                print("[!] Неверный номер")
+            continue
+
+        m = re.fullmatch(r"v\s*(\d+)", low)
+        if m:
+            idx = int(m.group(1))
+            if 1 <= idx <= len(accounts):
+                name, path = accounts[idx - 1]
+                problems = validate_tdata(tdata_content_dir(path))
+                if problems:
+                    print(f"[!] {name}: есть проблемы")
+                    for p in problems:
+                        print(f"      - {p}")
+                else:
+                    print(f"[+] {name}: OK")
             else:
                 print("[!] Неверный номер")
             continue
@@ -265,6 +324,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="создать ярлык аккаунта на рабочем столе (можно несколько раз)")
     p.add_argument("--shortcut-all", action="store_true", help="ярлыки для всех аккаунтов")
     p.add_argument("--list", action="store_true", help="показать список аккаунтов с метками")
+    p.add_argument("--check", action="store_true",
+                   help="вместе с --list: показать, есть ли проблемы с tdata у каждого аккаунта")
+    p.add_argument("--validate", nargs="*", metavar="NAME", default=None,
+                   help="проверить tdata на целостность (без имён — все аккаунты)")
     p.add_argument("--label-add", action="append", metavar="NAME[=#цвет]",
                    help="создать метку, напр. --label-add \"Работа=#539bf5\" (цвет необязателен)")
     p.add_argument("--tag", nargs=2, action="append", metavar=("АККАУНТ", "МЕТКА"),
@@ -282,7 +345,8 @@ def main(argv: list[str] | None = None, default_mode: str = "gui") -> int:
     root = Path(root_arg).expanduser().resolve() if root_arg else core.TDATA_ROOT
 
     headless = bool(args.run or args.imports or args.shortcut or args.shortcut_all or args.list
-                    or args.label_add or args.tag or args.untag or args.label_remove)
+                    or args.label_add or args.tag or args.untag or args.label_remove
+                    or args.validate is not None)
     if headless:
         code = 0
         if args.imports:
@@ -290,7 +354,9 @@ def main(argv: list[str] | None = None, default_mode: str = "gui") -> int:
         if args.label_add or args.tag or args.untag or args.label_remove:
             code |= do_labels(args, root)
         if args.list:
-            print_accounts(root)
+            print_accounts(root, check=args.check)
+        if args.validate is not None:
+            code |= do_validate(args.validate, root)
         if args.shortcut_all:
             code |= do_shortcuts([n for n, _ in find_accounts(root)], root)
         if args.shortcut:

@@ -15,10 +15,19 @@ HEX_DIR = "D877F783D5D3EF8C"
 
 
 def make_tdata(path: Path) -> None:
-    """Минимальная правдоподобная папка tdata."""
+    """Минимальная правдоподобная папка tdata (достаточно для find_accounts, но
+    не для validate_tdata — файлы там умышленно заведомо пустые/маленькие)."""
     (path / HEX_DIR).mkdir(parents=True)
     (path / HEX_DIR / "map1").write_bytes(b"x")
     (path / "key_datas").write_bytes(b"k")
+
+
+def make_valid_tdata(path: Path) -> None:
+    """Папка tdata, которая проходит validate_tdata без единой проблемы."""
+    (path / HEX_DIR).mkdir(parents=True)
+    (path / HEX_DIR / "map0").write_bytes(b"m" * 64)
+    (path / HEX_DIR / "map1").write_bytes(b"m" * 64)
+    (path / "key_datas").write_bytes(b"k" * 64)
 
 
 def make_zip(archive: Path, entries: dict[str, bytes]) -> Path:
@@ -227,6 +236,102 @@ class ImportTests(Base):
         os.symlink(d / "real.txt", d / "evil_file")
         core._strip_links(d)
         self.assertEqual(sorted(p.name for p in d.iterdir()), ["real.txt"])
+
+
+class ValidateTests(Base):
+    def test_valid_tdata_has_no_problems(self):
+        make_valid_tdata(self.root / "ok")
+        self.assertEqual(core.validate_tdata(self.root / "ok"), [])
+        self.assertTrue(core.is_tdata_valid(self.root / "ok"))
+
+    def test_not_a_tdata_folder(self):
+        (self.root / "junk").mkdir()
+        (self.root / "junk" / "readme.txt").write_text("hi")
+        problems = core.validate_tdata(self.root / "junk")
+        self.assertEqual(len(problems), 1)
+        self.assertIn("Не похоже на tdata", problems[0])
+
+    def test_missing_folder(self):
+        problems = core.validate_tdata(self.root / "ghost")
+        self.assertIn("Папка не найдена", problems[0])
+
+    def test_empty_key_datas(self):
+        make_valid_tdata(self.root / "a")
+        (self.root / "a" / "key_datas").write_bytes(b"")
+        problems = core.validate_tdata(self.root / "a")
+        self.assertTrue(any("пустой" in p for p in problems))
+        self.assertFalse(core.is_tdata_valid(self.root / "a"))
+
+    def test_truncated_key_datas(self):
+        make_valid_tdata(self.root / "a")
+        (self.root / "a" / "key_datas").write_bytes(b"k")
+        problems = core.validate_tdata(self.root / "a")
+        self.assertTrue(any("подозрительно маленький" in p for p in problems))
+
+    def test_missing_key_datas(self):
+        make_valid_tdata(self.root / "a")
+        (self.root / "a" / "key_datas").unlink()
+        problems = core.validate_tdata(self.root / "a")
+        self.assertTrue(any("Нет key_datas" in p for p in problems))
+
+    def test_missing_map_files(self):
+        make_valid_tdata(self.root / "a")
+        (self.root / "a" / HEX_DIR / "map0").unlink()
+        (self.root / "a" / HEX_DIR / "map1").unlink()
+        problems = core.validate_tdata(self.root / "a")
+        self.assertTrue(any("нет map0/map1" in p for p in problems))
+
+    def test_empty_map_file(self):
+        make_valid_tdata(self.root / "a")
+        (self.root / "a" / HEX_DIR / "map0").write_bytes(b"")
+        problems = core.validate_tdata(self.root / "a")
+        self.assertTrue(any("map0" in p and "пустой" in p for p in problems))
+
+    def test_missing_hex_dir(self):
+        self.root.joinpath("a").mkdir()
+        (self.root / "a" / "key_datas").write_bytes(b"k" * 64)
+        problems = core.validate_tdata(self.root / "a")
+        self.assertTrue(any("Нет hex-папки" in p for p in problems))
+
+    def test_tdata_content_dir_handles_both_layouts(self):
+        make_valid_tdata(self.root / "classic" / "tdata")
+        make_valid_tdata(self.root / "flat")
+        self.assertEqual(core.tdata_content_dir(self.root / "classic"), self.root / "classic" / "tdata")
+        self.assertEqual(core.tdata_content_dir(self.root / "flat"), self.root / "flat")
+
+    def test_cli_validate_reports_all_and_specific(self):
+        import contextlib
+        import io
+        import tdata_switcher as cli
+        make_valid_tdata(self.root / "Ivan" / "tdata")
+        make_tdata(self.root / "Petr" / "tdata")  # заведомо "битый" (пустые файлы)
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.main(["--root", str(self.root), "--validate"])
+        self.assertEqual(code, 1)  # Petr битый
+        self.assertIn("Ivan: OK", out.getvalue())
+        self.assertIn("Petr: есть проблемы", out.getvalue())
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.main(["--root", str(self.root), "--validate", "Ivan"])
+        self.assertEqual(code, 0)
+        self.assertIn("Ivan: OK", out.getvalue())
+        self.assertNotIn("Petr", out.getvalue())
+
+    def test_cli_list_check_marks_broken(self):
+        import contextlib
+        import io
+        import tdata_switcher as cli
+        make_valid_tdata(self.root / "Ivan" / "tdata")
+        make_tdata(self.root / "Petr" / "tdata")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cli.main(["--root", str(self.root), "--list", "--check"])
+        text = out.getvalue()
+        self.assertIn("Ivan   [+] OK", text)
+        self.assertIn("Petr   [!] проблем", text)
 
 
 class ShortcutTests(Base):
